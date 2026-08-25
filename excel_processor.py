@@ -1361,6 +1361,10 @@ class ExcelProcessorApp:
         except:
             pass
 
+        # 必须在隐藏主窗口之前完成居中：withdraw 后 winfo_width/height 在 Windows 上返回 1，
+        # 若此时再读尺寸设置 geometry，主窗口会变成 1x1 像素导致界面不可见
+        self._center_window()
+
         self._splash = None
         self._show_splash()  # 先显示启动画面，主窗口暂隐藏
 
@@ -1378,6 +1382,18 @@ class ExcelProcessorApp:
 
         self.create_widgets()
         self.root.after(SPLASH_MS, self._close_splash)
+
+    def _center_window(self):
+        """将主窗口居中（须在 withdraw 显示启动画面之前调用）"""
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        # 兜底：未取到真实尺寸时使用默认 900x700
+        if width < 100 or height < 100:
+            width, height = 900, 700
+        x = (self.root.winfo_screenwidth() - width) // 2
+        y = (self.root.winfo_screenheight() - height) // 2
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
 
     def _show_splash(self):
         """显示无边框启动画面，主窗口暂隐藏"""
@@ -4220,16 +4236,17 @@ class ExcelProcessorApp:
 def main():
     """主函数"""
     root = tk.Tk()
-    app = ExcelProcessorApp(root)
-    
-    # 居中显示窗口
-    root.update_idletasks()
-    width = root.winfo_width()
-    height = root.winfo_height()
-    x = (root.winfo_screenwidth() // 2) - (width // 2)
-    y = (root.winfo_screenheight() // 2) - (height // 2)
-    root.geometry(f'{width}x{height}+{x}+{y}')
-    
+    try:
+        app = ExcelProcessorApp(root)  # 内部完成窗口居中与启动画面
+    except Exception:
+        # GUI 打包（console=False）下异常无控制台输出，弹窗提示避免“双击无反应”
+        import traceback
+        try:
+            tk.messagebox.showerror("启动失败", f"程序启动时发生异常：\n\n{traceback.format_exc()}")
+        except Exception:
+            pass
+        raise
+
     root.mainloop()
 
 
