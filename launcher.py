@@ -13,14 +13,27 @@ from datetime import datetime
 
 
 def _launcher_log(msg):
-    """最早阶段的日志：写入可执行文件同目录的 运行日志.log"""
+    """最早阶段的日志：写入可执行文件（或 .app 应用包）同级目录的 运行日志.log，
+    同级目录不可写（如 Program Files）时回退到用户主目录。"""
     try:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
         if getattr(sys, 'frozen', False):
-            base = os.path.dirname(os.path.abspath(sys.executable))
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            # macOS .app 包内可执行文件路径为 App.app/Contents/MacOS/App，
+            # 提升到 .app 同级目录（dist/），与主程序 BASE_DIR 保持一致
+            if os.path.basename(exe_dir) == 'MacOS' and os.path.basename(os.path.dirname(exe_dir)) == 'Contents':
+                base = os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
+            else:
+                base = exe_dir
         else:
             base = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(base, '运行日志.log'), 'a', encoding='utf-8') as fh:
-            fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        for d in (base, os.path.expanduser('~')):
+            try:
+                with open(os.path.join(d, '运行日志.log'), 'a', encoding='utf-8') as fh:
+                    fh.write(line)
+                break  # 写入成功即停止
+            except Exception:
+                continue
     except Exception:
         pass
 

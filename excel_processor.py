@@ -1293,6 +1293,26 @@ AGENT_WORKSPACE_ROOT = os.path.join(BASE_DIR, 'agent_workspace')
 
 # 运行日志落盘（exe 同目录；源码运行时在项目目录）。任何异常静默忽略，不影响主流程。
 _LOG_LOCK = threading.Lock()
+_LOG_DIR_CACHE = [None]  # 日志目录缓存：优先可执行文件同级，不可写则回退用户主目录
+
+
+def _resolve_log_dir():
+    """确定可用的日志目录：BASE_DIR（可执行文件同级）不可写时回退到用户主目录"""
+    if _LOG_DIR_CACHE[0] is None:
+        for d in (BASE_DIR, os.path.expanduser('~')):
+            try:
+                os.makedirs(d, exist_ok=True)
+                test = os.path.join(d, '.log_write_test')
+                with open(test, 'a', encoding='utf-8'):
+                    pass
+                os.remove(test)
+                _LOG_DIR_CACHE[0] = d
+                break
+            except Exception:
+                continue
+        if _LOG_DIR_CACHE[0] is None:
+            _LOG_DIR_CACHE[0] = os.path.expanduser('~')
+    return _LOG_DIR_CACHE[0]
 
 
 def _runtime_log(msg):
@@ -1300,7 +1320,7 @@ def _runtime_log(msg):
     try:
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
         with _LOG_LOCK:
-            with open(os.path.join(BASE_DIR, '运行日志.log'), 'a', encoding='utf-8') as fh:
+            with open(os.path.join(_resolve_log_dir(), '运行日志.log'), 'a', encoding='utf-8') as fh:
                 fh.write(line)
     except Exception:
         pass
@@ -1395,7 +1415,27 @@ class ExcelProcessorApp:
         self._apikey_state = {}
 
         self.create_widgets()
+        self._log_window_state("界面组件创建完成")
         self.root.after(SPLASH_MS, self._close_splash)
+
+    def _log_window_state(self, tag, widget=None):
+        """记录窗口关键状态（state/geometry/尺寸/位置/映射/可见性），用于排查界面不显示问题"""
+        try:
+            w = widget if widget is not None else self.root
+            try:
+                st = w.state()
+            except Exception:
+                st = 'n/a'
+            try:
+                geo = w.geometry()
+            except Exception:
+                geo = 'n/a'
+            _runtime_log(f"[窗口] {tag}: state={st} geometry={geo} "
+                         f"size={w.winfo_width()}x{w.winfo_height()} "
+                         f"pos=({w.winfo_x()},{w.winfo_y()}) "
+                         f"mapped={w.winfo_ismapped()} viewable={w.winfo_viewable()}")
+        except Exception:
+            pass
 
     def _center_window(self):
         """将主窗口居中（须在 withdraw 显示启动画面之前调用）"""
@@ -1408,10 +1448,12 @@ class ExcelProcessorApp:
         x = (self.root.winfo_screenwidth() - width) // 2
         y = (self.root.winfo_screenheight() - height) // 2
         self.root.geometry(f'{width}x{height}+{x}+{y}')
+        self._log_window_state("窗口居中完成")
 
     def _show_splash(self):
         """显示无边框启动画面，主窗口暂隐藏"""
         self.root.withdraw()
+        self._log_window_state("主窗口已隐藏(启动画面阶段)")
         splash = tk.Toplevel(self.root)
         splash.overrideredirect(True)
         splash.configure(bg="#2b579a")
@@ -1427,6 +1469,7 @@ class ExcelProcessorApp:
                  bg="#2b579a", fg="#a8c4f0").pack(side=tk.BOTTOM, pady=10)
         self._splash = splash
         self.root.update()  # 立即绘制启动画面
+        self._log_window_state("启动画面已显示", splash)
 
     def _close_splash(self):
         """关闭启动画面，显示主窗口"""
@@ -1438,8 +1481,12 @@ class ExcelProcessorApp:
             self._splash = None
         try:
             self.root.deiconify()
+            self.root.update_idletasks()
         except tk.TclError:
             pass
+        self._log_window_state("主窗口已显示(启动画面关闭)")
+        # 延迟复核：确认主窗口显示后仍保持可见（排查“闪一下又消失”的情况）
+        self.root.after(1500, lambda: self._log_window_state("主窗口显示1.5秒后"))
         
     def create_widgets(self):
         """创建界面组件"""
@@ -4257,12 +4304,14 @@ def main():
     _runtime_log(f"运行模式: {'打包可执行文件' if getattr(sys, 'frozen', False) else '源码运行'}")
     _runtime_log(f"程序路径: {sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)}")
     _runtime_log(f"工作目录: {os.getcwd()}")
-    _runtime_log(f"日志目录: {BASE_DIR}")
+    _runtime_log(f"日志目录: {_resolve_log_dir()}")
 
     root = None
     try:
         _runtime_log("正在创建主窗口...")
         root = tk.Tk()
+        _runtime_log(f"Tk版本: {root.tk.call('info', 'patchlevel')}")
+        _runtime_log(f"屏幕尺寸: {root.winfo_screenwidth()}x{root.winfo_screenheight()}")
         _runtime_log("正在初始化应用界面...")
         app = ExcelProcessorApp(root)  # 内部完成窗口居中与启动画面
         _runtime_log("界面初始化完成，进入主循环")
