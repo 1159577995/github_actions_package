@@ -4235,14 +4235,20 @@ class ExcelProcessorApp:
 
 def main():
     """主函数"""
+    import traceback
     root = tk.Tk()
     try:
         app = ExcelProcessorApp(root)  # 内部完成窗口居中与启动画面
     except Exception:
-        # GUI 打包（console=False）下异常无控制台输出，弹窗提示避免“双击无反应”
-        import traceback
+        # GUI 打包（console=False）下异常无控制台输出：写日志文件 + 弹窗提示，避免“双击无反应”
         try:
-            tk.messagebox.showerror("启动失败", f"程序启动时发生异常：\n\n{traceback.format_exc()}")
+            log_path = os.path.join(BASE_DIR, '启动错误.log')
+            with open(log_path, 'a', encoding='utf-8') as fh:
+                fh.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动异常:\n{traceback.format_exc()}\n")
+        except Exception:
+            pass
+        try:
+            tk.messagebox.showerror("启动失败", f"程序启动时发生异常，详情已写入启动错误.log：\n\n{traceback.format_exc()}")
         except Exception:
             pass
         raise
