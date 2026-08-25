@@ -12,15 +12,16 @@
 ├── .github/
 │   └── workflows/
 │       └── build.yml            ← GitHub Actions 工作流（自动打包核心）
-├── excel_processor.py            ← 主程序
-├── excel_processor.spec          ← PyInstaller 配置（Windows/Linux 用）
-├── excel_processor_macos.spec    ← PyInstaller 配置（macOS .app 用）
-├── requirements.txt              ← Python 依赖
-├── build_all.sh                  ← 一键打包主入口
-├── build_macos.sh                ← macOS 打包脚本
-├── build_linux.sh                ← Linux/信创打包脚本
-├── build_windows.bat             ← Windows 打包脚本
-└── GitHub Actions 打包流程.md     ← 本文档
+├── launcher.py                  ← 程序启动入口（双击后从这里开始记录日志）
+├── excel_processor.py           ← 主程序
+├── excel_processor.spec         ← PyInstaller 配置（Windows/Linux 用）
+├── excel_processor_macos.spec   ← PyInstaller 配置（macOS .app 用）
+├── requirements.txt             ← Python 依赖
+├── build_all.sh                 ← 一键打包主入口
+├── build_macos.sh               ← macOS 打包脚本
+├── build_linux.sh               ← Linux/信创打包脚本
+├── build_windows.bat            ← Windows 打包脚本
+└── GitHub Actions 打包流程.md    ← 本文档
 ```
 
 > 注意：此文件夹是**打包快照**。若以后修改了主程序（`excel_processor.py` 等），
@@ -33,7 +34,7 @@
 1. 在 GitHub 新建一个仓库（Public / Private 均可）；
 2. 把本文件夹**内所有内容**上传到仓库根目录，两种方式任选：
    - **网页上传**：进入仓库页面 → `Add file` → `Upload files`，把本文件夹里的
-     `excel_processor.py`、`excel_processor.spec`、`excel_processor_macos.spec`、
+     `launcher.py`、`excel_processor.py`、`excel_processor.spec`、`excel_processor_macos.spec`、
      `requirements.txt`、`build_all.sh`、`build_macos.sh`、`build_linux.sh`、
      `build_windows.bat`、`GitHub Actions 打包流程.md` 以及 `.github/workflows/build.yml`
      全部拖进去（注意 `.github` 是隐藏文件夹，拖入整个文件夹即可）；
@@ -88,6 +89,8 @@
 - **Linux / 信创**：`chmod +x` 后双击运行；建议在真实信创机器（麒麟/统信）上做一次冒烟验证，
   选择与机器 CPU 架构匹配的产物（x86_64 或 aarch64）。
 - 文件处理 Agent 的沙箱工作区 `agent_workspace/` 生成在可执行文件同目录。
+- **运行日志**：双击运行后在可执行文件同目录自动生成 `运行日志.log`（启动/处理/异常全程记录）；
+  启动失败还会生成 `启动错误.log`（完整堆栈）。用户反馈"双击无反应"时，先看这两个文件。
 
 ---
 

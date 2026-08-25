@@ -1291,6 +1291,20 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENT_WORKSPACE_ROOT = os.path.join(BASE_DIR, 'agent_workspace')
 
+# 运行日志落盘（exe 同目录；源码运行时在项目目录）。任何异常静默忽略，不影响主流程。
+_LOG_LOCK = threading.Lock()
+
+
+def _runtime_log(msg):
+    """追加一行到 运行日志.log，格式与界面日志一致 [HH:MM:SS]"""
+    try:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
+        with _LOG_LOCK:
+            with open(os.path.join(BASE_DIR, '运行日志.log'), 'a', encoding='utf-8') as fh:
+                fh.write(line)
+    except Exception:
+        pass
+
 
 def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
     """受限执行生成代码：隔离工作区 + 环境白名单 + 超时；返回 (ok, log, output_files)"""
@@ -1945,6 +1959,7 @@ class ExcelProcessorApp:
         self.forward_log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.forward_log_text.see(tk.END)
         self.root.update()
+        _runtime_log(message)
 
     def forward_select_files(self):
         """正向模式：选择文件"""
@@ -3195,11 +3210,12 @@ class ExcelProcessorApp:
             messagebox.showerror("错误", error_msg)
 
     def log(self, message):
-        """添加日志"""
+        """添加日志（界面 + 落盘 运行日志.log）"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
         self.root.update()
+        _runtime_log(message)
         
     def start_processing(self):
         """开始处理"""
@@ -4234,26 +4250,44 @@ class ExcelProcessorApp:
 
 
 def main():
-    """主函数"""
+    """主函数：从启动起全程写运行日志；异常同时落盘 启动错误.log 并弹窗提示"""
     import traceback
-    root = tk.Tk()
+    _runtime_log("=" * 60)
+    _runtime_log("程序启动")
+    _runtime_log(f"运行模式: {'打包可执行文件' if getattr(sys, 'frozen', False) else '源码运行'}")
+    _runtime_log(f"程序路径: {sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)}")
+    _runtime_log(f"工作目录: {os.getcwd()}")
+    _runtime_log(f"日志目录: {BASE_DIR}")
+
+    root = None
     try:
+        _runtime_log("正在创建主窗口...")
+        root = tk.Tk()
+        _runtime_log("正在初始化应用界面...")
         app = ExcelProcessorApp(root)  # 内部完成窗口居中与启动画面
+        _runtime_log("界面初始化完成，进入主循环")
     except Exception:
-        # GUI 打包（console=False）下异常无控制台输出：写日志文件 + 弹窗提示，避免“双击无反应”
+        _runtime_log("启动异常:\n" + traceback.format_exc())
         try:
-            log_path = os.path.join(BASE_DIR, '启动错误.log')
-            with open(log_path, 'a', encoding='utf-8') as fh:
+            err_path = os.path.join(BASE_DIR, '启动错误.log')
+            with open(err_path, 'a', encoding='utf-8') as fh:
                 fh.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动异常:\n{traceback.format_exc()}\n")
         except Exception:
             pass
         try:
-            tk.messagebox.showerror("启动失败", f"程序启动时发生异常，详情已写入启动错误.log：\n\n{traceback.format_exc()}")
+            if root is not None:
+                tk.messagebox.showerror("启动失败", f"程序启动时发生异常，详情见 运行日志.log：\n\n{traceback.format_exc()}")
         except Exception:
             pass
         raise
 
-    root.mainloop()
+    try:
+        root.mainloop()
+    except Exception:
+        _runtime_log("运行异常:\n" + traceback.format_exc())
+        raise
+    finally:
+        _runtime_log("程序退出")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ icon_path = os.environ.get('ICON_PATH', '')
 use_icon = bool(icon_path) and os.path.exists(icon_path)
 
 a = Analysis(
-    ['excel_processor.py'],
+    ['launcher.py'],
     pathex=[],
     binaries=[],
     datas=[(icon_path, '.')] if use_icon else [],
