@@ -1131,7 +1131,8 @@ def build_agent_graph(app):
                 api_url, api_key, user_request, file_metadata, sample_rows, EXECUTION_CONSTRAINTS)
             code = str(result.get('code', '') or '')
             if not code:
-                logs.append(f"代码生成为空: {str(result)[:200]}")
+                keys = list(result.keys()) if isinstance(result, dict) else []
+                logs.append(f"代码生成为空: keys={keys} preview={str(result)[:200]}")
                 return {'logs': logs, 'status': 'failed', 'error': '代码生成为空'}
             logs.append(f"代码生成成功: {str(result.get('description', ''))[:200]}")
             return {
@@ -1213,6 +1214,8 @@ EXECUTION_CONSTRAINTS = (
     "input_dir = os.environ['INPUT_DIR']、output_dir = os.environ['OUTPUT_DIR']。"
     "绝对不要硬编码 /input、/output、/tmp 等路径，也不要读取 file_metadata 中的原始绝对路径。"
     "只能操作系统分配的工作目录；只能读取 INPUT_DIR 中的输入文件；只能写入 OUTPUT_DIR。"
+    "必须至少生成 1 个输出文件到 OUTPUT_DIR；禁止只打印统计结果而不落盘。"
+    "脚本结束前必须 print 生成的输出文件名或输出路径，便于日志排查。"
     "禁止网络访问；禁止 subprocess/os.system/shell；禁止删除文件；禁止覆盖原文件；"
     "禁止读取环境变量中的密钥；禁止访问 HOME 目录；禁止 pip install；禁止 eval/exec；"
     "必须使用确定性的文件处理逻辑；优先使用 openpyxl/csv/json/pathlib/re/datetime，只有在明显更合适时才使用 pandas。"
@@ -1300,10 +1303,47 @@ def _sandbox_builtins():
         'abs', 'all', 'any', 'bool', 'dict', 'enumerate', 'filter', 'float',
         'int', 'isinstance', 'len', 'list', 'max', 'min', 'print', 'range',
         'round', 'set', 'sorted', 'str', 'sum', 'tuple', 'zip',
+        'BaseException', 'Exception', 'ValueError', 'TypeError', 'RuntimeError',
+        'KeyError', 'IndexError', 'NameError', 'FileNotFoundError', 'OSError',
     }
     result = {name: builtin_obj[name] for name in allowed if name in builtin_obj}
     result['__import__'] = _sandbox_import
     return result
+
+
+def _extract_json_string_field(text, field):
+    """从 JSON/类 JSON 文本中提取字符串字段。"""
+    if not text:
+        return ''
+    patterns = [
+        rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"',
+        rf"'{re.escape(field)}'\s*:\s*'((?:\\.|[^'\\])*)'",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.DOTALL)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            if pat.startswith('"'):
+                return json.loads(f'"{raw}"')
+            return ast.literal_eval(f"'{raw}'")
+        except (json.JSONDecodeError, SyntaxError, ValueError):
+            return raw.replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'")
+    return ''
+
+
+def _normalize_codegen_payload(payload):
+    """将代码生成结果统一整理为 {code, description, ...} 结构。"""
+    if isinstance(payload, dict):
+        code = str(payload.get('code', '') or '')
+        desc = str(payload.get('description', '') or '')
+        if code:
+            normalized = dict(payload)
+            normalized['code'] = code
+            normalized['description'] = desc
+            return normalized
+    return None
 
 
 # 沙箱工作区根目录：源码运行取项目目录；PyInstaller 打包后 __file__ 指向临时解压目录或
@@ -2601,6 +2641,9 @@ class ExcelProcessorApp:
         outputs = data.get('outputs') or {}
         if status and str(status).lower() not in ('succeeded', 'success', 'stopped'):
             raise Exception(f"代码生成工作流未成功: status={status}, {json.dumps(result, ensure_ascii=False)[:300]}")
+        normalized = _normalize_codegen_payload(outputs)
+        if normalized is not None:
+            return normalized
         result_str = outputs.get('result', '')
         if not result_str:
             raise Exception(
@@ -2609,8 +2652,16 @@ class ExcelProcessorApp:
                 f"{json.dumps(result, ensure_ascii=False)[:300]}")
         if isinstance(result_str, str):
             parsed = _parse_json_loose(result_str)
-            if isinstance(parsed, dict):
-                return parsed
+            normalized = _normalize_codegen_payload(parsed)
+            if normalized is not None:
+                return normalized
+            fallback = {
+                'code': _extract_json_string_field(result_str, 'code'),
+                'description': _extract_json_string_field(result_str, 'description'),
+            }
+            normalized = _normalize_codegen_payload(fallback)
+            if normalized is not None:
+                return normalized
         return outputs
 
     def parse_intent_response(self, text):
