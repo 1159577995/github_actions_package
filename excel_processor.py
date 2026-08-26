@@ -5,7 +5,7 @@ Excel表格处理工具 - 调用Dify API匹配答案并填充渠道信息
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import openpyxl
 from openpyxl import load_workbook
 import requests
@@ -180,11 +180,21 @@ AGENT_TASK_WHITELIST = {'statistics', 'export_failed', 'retry', 'diff', 'export_
 
 INTENT_PROMPT_TEMPLATE = """你是一个Excel文件处理需求识别器。以下是选中Excel文件的列结构说明：
 {column_structure}
-
+{history_section}
 运维人员的需求描述：
 {request}
 
-请从以下任务中选择最匹配的一个并提取参数，只输出JSON对象（不要输出任何其他内容）：
+请从以下任务中选择最匹配的一个并提取参数，只输出JSON对象（不要输出任何其他内容），格式为：
+{{
+  "task": "任务名",
+  "params": {{}},
+  "confidence": 0到1的置信度,
+  "understanding": "用1-2句话复述你对用户需求的理解（供用户确认）",
+  "clarify_questions": ["需求中含糊或缺失的关键信息问题；明确则为空数组"],
+  "can_use_builtin_tool": true或false
+}}
+
+可选任务：
 1. {{"task":"statistics","params":{{}}}}  统计报表：关键字/相似度匹配占比、成功率、渠道分布、命中类型、失败原因
 2. {{"task":"export_failed","params":{{"scope":"reverse|forward|all","format":"excel|csv"}}}}  导出失败项为新文件
 3. {{"task":"retry","params":{{"mode":"reverse|forward"}}}}  对失败行重新调用接口处理
@@ -196,9 +206,46 @@ INTENT_PROMPT_TEMPLATE = """你是一个Excel文件处理需求识别器。以�
    inspect_excel / read_excel(limit) / read_text / search_text(keyword) /
    replace_text(find,replace) / copy_file / validate_output
    例如：{{"task":"filter_excel","params":{{"column":"P","operator":"equals","value":"失败"}}}}
-如果需求无法用上述任务完成，输出：{{"task":"custom","params":{{}},"reason":"简要说明"}}
+如果需求无法用上述任务完成，输出：{{"task":"custom","params":{{}},"reason":"简要说明","can_use_builtin_tool":false}}
+
+澄清规则：
+- 当需求存在歧义、缺少关键参数（统计口径/列名/范围/输出格式等）、或引用了文件列结构中不存在的列时，必须在 clarify_questions 中逐条列出需要用户补充的问题。
+- 当需求明确无歧义时，clarify_questions 必须为空数组 []。
 
 注意：绝对不要输出本地文件的绝对路径，文件引用一律使用序号索引（file_index）。"""
+
+
+def _format_history_section(conversation):
+    """将多轮对话历史格式化为 prompt 片段（无历史时返回空串）"""
+    conv = conversation or []
+    if not conv:
+        return ''
+    lines = ['此前对话背景：']
+    for item in conv[-6:]:  # 截断，仅保留最近 6 条
+        role = '用户' if item.get('role') == 'user' else 'Agent'
+        lines.append(f"{role}: {item.get('content', '')}")
+    return '\n'.join(lines)
+
+
+REFLECTION_PROMPT_TEMPLATE = """你是文件处理结果质检员。以下是：
+1. 用户需求：
+{request}
+
+2. 输入文件结构：
+{input_meta}
+
+3. 输出文件结构：
+{output_meta}
+
+4. 输出摘要：
+{output_summary}
+
+请判断输出结果是否真正满足用户需求。只输出JSON对象（不要输出任何其他内容）：
+{{
+  "satisfied": true或false,
+  "reason": "判断依据（简短）",
+  "suggestions": "若不满足，给出具体改进建议（一句话）；满足则为空字符串"
+}}"""
 
 
 def _cell_str(row, idx):
@@ -894,31 +941,180 @@ def compare_excel(files, params, out_dir):
     return [p], report
 
 
-# 工具注册表（name → 元数据 + 统一 run 调用）
+# 工具注册表（name → 元数据 + 统一 run 调用 + 参数 schema）
+# input_schema: {参数名: {type, enum?, required?, default?, desc?}} —— 供 planner 校验参数完整性，驱动澄清循环
 TOOL_REGISTRY = {
-    'statistics': {'description': '统计Excel匹配情况（占比/渠道/失败原因）', 'risk_level': 'low', 'deterministic': True, 'run': statistics_excel},
-    'export_failed': {'description': '导出失败项为新文件', 'risk_level': 'low', 'deterministic': True, 'run': export_failed_tool},
-    'diff': {'description': '对比两个Excel的O列渠道差异', 'risk_level': 'low', 'deterministic': True, 'run': compare_excel},
-    'export_csv': {'description': '通用导出指定列为CSV', 'risk_level': 'low', 'deterministic': True, 'run': export_csv_tool},
-    'retry': {'description': '对失败行重新调用接口处理', 'risk_level': 'high', 'deterministic': False, 'run': None},
-    'inspect_file': {'description': '文件基础信息', 'risk_level': 'low', 'deterministic': True, 'run': inspect_file},
-    'detect_file_type': {'description': '识别文件类型', 'risk_level': 'low', 'deterministic': True, 'run': detect_file_type},
-    'read_file': {'description': '统一读取文件（按类型分发）', 'risk_level': 'low', 'deterministic': True, 'run': None},
-    'copy_file': {'description': '复制文件为新名', 'risk_level': 'low', 'deterministic': True, 'run': copy_file},
-    'inspect_excel': {'description': 'Excel结构分析', 'risk_level': 'low', 'deterministic': True, 'run': inspect_excel},
-    'read_excel': {'description': '读取Excel表头与前N行', 'risk_level': 'low', 'deterministic': True, 'run': read_excel},
-    'filter_excel': {'description': '按列过滤行', 'risk_level': 'low', 'deterministic': True, 'run': filter_excel},
-    'sort_excel': {'description': '按列排序', 'risk_level': 'low', 'deterministic': True, 'run': sort_excel},
-    'group_excel': {'description': '按列分组为多个Sheet', 'risk_level': 'low', 'deterministic': True, 'run': group_excel},
-    'merge_excel': {'description': '多文件合并', 'risk_level': 'low', 'deterministic': True, 'run': merge_excel},
-    'split_excel': {'description': '按行数拆分', 'risk_level': 'low', 'deterministic': True, 'run': split_excel},
-    'modify_excel': {'description': '通用修改（replace/delete_rows）', 'risk_level': 'medium', 'deterministic': True, 'run': modify_excel},
-    'export_excel': {'description': '导出为新Excel（不覆盖源）', 'risk_level': 'low', 'deterministic': True, 'run': export_excel},
-    'read_text': {'description': '读取文本文件', 'risk_level': 'low', 'deterministic': True, 'run': read_text},
-    'search_text': {'description': '文本关键词搜索', 'risk_level': 'low', 'deterministic': True, 'run': search_text},
-    'replace_text': {'description': '文本替换为新文件', 'risk_level': 'low', 'deterministic': True, 'run': replace_text},
-    'validate_output': {'description': '输出文件校验', 'risk_level': 'low', 'deterministic': True, 'run': validate_output},
+    'statistics': {'description': '统计Excel匹配情况（占比/渠道/失败原因）', 'risk_level': 'low', 'deterministic': True,
+                   'input_schema': {}, 'run': statistics_excel},
+    'export_failed': {'description': '导出失败项为新文件', 'risk_level': 'low', 'deterministic': True,
+                      'input_schema': {
+                          'scope': {'type': 'str', 'enum': ['reverse', 'forward', 'all'], 'required': False, 'default': 'all', 'desc': '失败范围'},
+                          'format': {'type': 'str', 'enum': ['excel', 'csv'], 'required': False, 'default': 'excel', 'desc': '导出格式'},
+                      }, 'run': export_failed_tool},
+    'diff': {'description': '对比两个Excel的O列渠道差异', 'risk_level': 'low', 'deterministic': True,
+             'input_schema': {
+                 'file_index': {'type': 'int', 'required': False, 'default': 0, 'desc': '源文件序号（从0开始）'},
+                 'other_file_index': {'type': 'int', 'required': False, 'default': 1, 'desc': '对比文件序号（从0开始）'},
+             }, 'run': compare_excel},
+    'export_csv': {'description': '通用导出指定列为CSV', 'risk_level': 'low', 'deterministic': True,
+                   'input_schema': {
+                       'columns': {'type': 'str', 'required': True, 'desc': '列号或列名，逗号分隔，如 "1,8,15"'},
+                       'filter': {'type': 'str', 'required': False, 'default': '', 'desc': '过滤关键词'},
+                   }, 'run': export_csv_tool},
+    'retry': {'description': '对失败行重新调用接口处理', 'risk_level': 'high', 'deterministic': False,
+              'input_schema': {
+                  'mode': {'type': 'str', 'enum': ['reverse', 'forward'], 'required': True, 'desc': '重试方向'},
+              }, 'run': None},
+    'inspect_file': {'description': '文件基础信息', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': inspect_file},
+    'detect_file_type': {'description': '识别文件类型', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': detect_file_type},
+    'read_file': {'description': '统一读取文件（按类型分发）', 'risk_level': 'low', 'deterministic': True,
+                  'input_schema': {'limit': {'type': 'int', 'required': False, 'default': 5, 'desc': '读取行数'}}, 'run': None},
+    'copy_file': {'description': '复制文件为新名', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': copy_file},
+    'inspect_excel': {'description': 'Excel结构分析', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': inspect_excel},
+    'read_excel': {'description': '读取Excel表头与前N行', 'risk_level': 'low', 'deterministic': True,
+                   'input_schema': {'limit': {'type': 'int', 'required': False, 'default': 5, 'desc': '读取行数'}}, 'run': read_excel},
+    'filter_excel': {'description': '按列过滤行', 'risk_level': 'low', 'deterministic': True,
+                     'input_schema': {
+                         'column': {'type': 'str', 'required': True, 'desc': '列号（如 P）或列名'},
+                         'operator': {'type': 'str', 'enum': ['equals', 'not_equals', 'contains', 'gte', 'lte', 'gt', 'lt'], 'required': False, 'default': 'equals', 'desc': '过滤操作符'},
+                         'value': {'type': 'str', 'required': False, 'default': '', 'desc': '过滤值'},
+                     }, 'run': filter_excel},
+    'sort_excel': {'description': '按列排序', 'risk_level': 'low', 'deterministic': True,
+                   'input_schema': {
+                       'column': {'type': 'str', 'required': True, 'desc': '列号（如 P）或列名'},
+                       'desc': {'type': 'bool', 'required': False, 'default': False, 'desc': '是否降序'},
+                   }, 'run': sort_excel},
+    'group_excel': {'description': '按列分组为多个Sheet', 'risk_level': 'low', 'deterministic': True,
+                    'input_schema': {
+                        'column': {'type': 'str', 'required': True, 'desc': '分组列号（如 O）或列名'},
+                    }, 'run': group_excel},
+    'merge_excel': {'description': '多文件合并', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': merge_excel},
+    'split_excel': {'description': '按行数拆分', 'risk_level': 'low', 'deterministic': True,
+                    'input_schema': {
+                        'rows_per_sheet': {'type': 'int', 'required': False, 'default': 500, 'desc': '每个Sheet行数'},
+                    }, 'run': split_excel},
+    'modify_excel': {'description': '通用修改（replace/delete_rows）', 'risk_level': 'medium', 'deterministic': True,
+                     'input_schema': {
+                         'ops': {'type': 'list', 'required': True, 'desc': '操作列表，如 [{type:replace,column,find,replace}]'},
+                     }, 'run': modify_excel},
+    'export_excel': {'description': '导出为新Excel（不覆盖源）', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': export_excel},
+    'read_text': {'description': '读取文本文件', 'risk_level': 'low', 'deterministic': True,
+                  'input_schema': {'limit': {'type': 'int', 'required': False, 'default': 50, 'desc': '读取行数'}}, 'run': read_text},
+    'search_text': {'description': '文本关键词搜索', 'risk_level': 'low', 'deterministic': True,
+                    'input_schema': {
+                        'keyword': {'type': 'str', 'required': True, 'desc': '搜索关键词'},
+                        'limit': {'type': 'int', 'required': False, 'default': 20, 'desc': '返回样例行数'},
+                    }, 'run': search_text},
+    'replace_text': {'description': '文本替换为新文件', 'risk_level': 'low', 'deterministic': True,
+                     'input_schema': {
+                         'find': {'type': 'str', 'required': True, 'desc': '查找内容'},
+                         'replace': {'type': 'str', 'required': False, 'default': '', 'desc': '替换为'},
+                     }, 'run': replace_text},
+    'validate_output': {'description': '输出文件校验', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': validate_output},
 }
+
+
+def validate_tool_params(tool, params):
+    """校验工具参数是否满足 input_schema；返回 (is_ok, missing_questions)
+
+    missing_questions 为可向用户提出的澄清问题列表（缺失/非法参数 → 需要用户补充）。
+    """
+    schema = TOOL_REGISTRY.get(tool, {}).get('input_schema', {})
+    params = params or {}
+    questions = []
+    for name, spec in schema.items():
+        val = params.get(name)
+        if spec.get('required') and (val is None or val == '' or val == []):
+            enum_hint = f"（可选值: {'/'.join(str(e) for e in spec['enum'])}）" if spec.get('enum') else ''
+            desc = spec.get('desc') or name
+            questions.append(f"请提供参数「{name}」：{desc}{enum_hint}")
+    return (len(questions) == 0), questions
+
+
+def collect_output_meta(output_files):
+    """本地读取输出文件结构（Sheet/行数/列头），不含绝对路径，供反思质检使用"""
+    metas = []
+    for path in output_files or []:
+        try:
+            t = detect_file_type(path)
+            m = {'basename': os.path.basename(path), 'type': t}
+            if t in ('xlsx', 'xls'):
+                wb = load_workbook(path, read_only=True)
+                ws = wb.active
+                m['sheets'] = wb.sheetnames
+                m['rows'] = ws.max_row
+                m['columns'] = ws.max_column
+                try:
+                    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                    m['headers'] = [str(h) if h is not None else '' for h in header]
+                except StopIteration:
+                    m['headers'] = []
+                wb.close()
+            elif t == 'csv':
+                with open(path, encoding='utf-8-sig', errors='replace') as fh:
+                    first = fh.readline()
+                    rows = 1 + sum(1 for _ in fh)
+                m['headers'] = [c.strip() for c in first.split(',')] if first else []
+                m['rows'] = rows
+                m['columns'] = len(m['headers'])
+            metas.append(m)
+        except Exception as e:
+            metas.append({'basename': os.path.basename(path), 'type': 'unknown', 'error': str(e)})
+    return metas
+
+
+def _column_structure_text(metas):
+    """将文件元数据格式化为列结构文本（供意图识别 prompt / 澄清交互展示）。
+
+    完整展示三类列：有表头列、有数据但无表头的列（data_columns）、空列（empty_columns）。
+    避免"有数据无表头"的列被隐藏导致模型误判列不存在。
+    """
+    from openpyxl.utils import get_column_letter
+    if not metas:
+        return COLUMN_STRUCTURE
+    m = metas[0]
+    headers = m.get('headers') or []
+    if not headers:
+        return COLUMN_STRUCTURE
+    parts = [f"文件[{i}]: {mm.get('basename')}" for i, mm in enumerate(metas)]
+    cols = ', '.join(f"{get_column_letter(i + 1)}:{h}" for i, h in enumerate(headers) if h)
+    parts.append(f"列结构: {cols}")
+    data_cols = m.get('data_columns') or []
+    if data_cols:
+        samples = m.get('data_samples') or {}
+        parts.append('数据列(无表头): ' + ', '.join(
+            f"{c}(示例: {samples[c]})" if samples.get(c) else c for c in data_cols))
+    empty_cols = m.get('empty_columns') or []
+    if empty_cols:
+        parts.append(f"空列: {', '.join(empty_cols)}")
+    return '\n'.join(parts)
+
+
+def _detect_headerless_data_columns(ws, headers):
+    """检测"表头为空但数据行有值"的列。
+
+    返回 (data_cols, empty_cols, data_samples)：
+    - data_cols: 无表头但有数据的列字母（如 ['O','Q','R','S']）
+    - empty_cols: 无表头且无数据的列字母
+    - data_samples: {列字母: 首行示例值}（供列语义提示，截断 30 字符）
+    仅扫描前几行数据（read_only 大文件友好）。
+    """
+    from openpyxl.utils import get_column_letter
+    data_cols = []
+    data_samples = {}
+    for row in ws.iter_rows(min_row=2, max_row=4, values_only=True):
+        if any(v is not None and str(v).strip() for v in row):
+            for i, v in enumerate(row):
+                if i < len(headers) and not headers[i] and v is not None and str(v).strip():
+                    letter = get_column_letter(i + 1)
+                    if letter not in data_cols:
+                        data_cols.append(letter)
+                        data_samples[letter] = str(v).strip()[:30]
+            break
+    data_set = set(data_cols)
+    empty_cols = [get_column_letter(i + 1) for i, h in enumerate(headers)
+                  if not h and get_column_letter(i + 1) not in data_set]
+    return data_cols, empty_cols, data_samples
 
 
 def read_file(files, params, out_dir):
@@ -961,13 +1157,28 @@ class FileAgentState(TypedDict, total=False):
     error: Optional[str]
     logs: list
     status: str
+    # ---- 新增：对话与理解（澄清/理解确认循环） ----
+    conversation: list          # 多轮对话历史 [{role:'user'|'assistant', content}]
+    understanding: str          # Agent 对需求的理解复述（自然语言）
+    clarify_questions: list     # 需要澄清的问题列表
+    clarify_answers: dict       # 用户对澄清问题的回答 {问题 -> 回答}
+    clarify_rounds: int         # 澄清轮次计数（防无限循环，上限 3）
+    understanding_ok: bool      # 用户是否确认理解正确
+    user_revision: str          # 用户对需求的修正/补充（触发重新理解）
+    # ---- 新增：结果反思与用户反馈（反思修复/反馈循环） ----
+    verification: dict          # 结果自检 {ok, reason, checks:[{name, passed, detail}]}
+    repair_rounds: int          # 已修复轮次计数
+    max_repair_rounds: int      # 最大修复轮次（默认 2）
+    repair_feedback: str        # 反思意见（供重新生成代码）
+    final_feedback: str         # 用户最终反馈（修改意见，触发下一轮）
+    finished: bool              # 用户是否确认满意
 
 
 def build_agent_graph(app):
-    """构建 LangGraph：inspect → intent → planner → route → (execute → validate → summary)"""
+    """构建 LangGraph：inspect → intent → 澄清/理解确认 → planner → route → (execute → validate → verify → summary)"""
     from langgraph.graph import StateGraph, START, END
     from langgraph.checkpoint.memory import InMemorySaver
-    from openpyxl.utils import get_column_letter
+    from langgraph.types import interrupt, Command
 
     def inspect_files(state):
         logs = list(state.get('logs') or [])
@@ -987,49 +1198,120 @@ def build_agent_graph(app):
                         m['headers'] = [str(h) if h is not None else '' for h in header]
                     except StopIteration:
                         m['headers'] = []
+                    # 数据列采集：表头为空但数据行有值的列（如 O/Q/R/S），避免被误判为不存在
+                    data_cols, empty_cols, data_samples = _detect_headerless_data_columns(ws, m.get('headers') or [])
+                    m['data_columns'] = data_cols
+                    m['empty_columns'] = empty_cols
+                    m['data_samples'] = data_samples
                     wb.close()
                 elif t == 'csv':
                     with open(path, encoding='utf-8-sig', errors='replace') as fh:
                         first = fh.readline()
                     m['headers'] = [c.strip() for c in first.split(',')] if first else []
                     m['columns'] = len(m['headers'])
+                    m['data_columns'] = []
+                    m['empty_columns'] = []
+                    m['data_samples'] = {}
                 else:
                     m['headers'] = []
+                    m['data_columns'] = []
+                    m['empty_columns'] = []
+                    m['data_samples'] = {}
                 metas.append(m)
-                logs.append(f"inspect: {m['basename']} type={t} rows={m.get('rows')} cols={m.get('columns')}")
+                logs.append(f"inspect: {m['basename']} type={t} rows={m.get('rows')} cols={m.get('columns')}"
+                            + (f" 数据列:{','.join(m['data_columns'])}" if m.get('data_columns') else ''))
             except Exception as e:
                 metas.append({'path': path, 'basename': os.path.basename(path), 'type': 'unknown', 'error': str(e)})
                 logs.append(f"inspect失败 {os.path.basename(path)}: {str(e)}")
         return {'file_metadata': metas, 'logs': logs}
-
-    def _column_structure_text(metas):
-        if not metas:
-            return COLUMN_STRUCTURE
-        m = metas[0]
-        headers = m.get('headers') or []
-        if not headers:
-            return COLUMN_STRUCTURE
-        parts = [f"文件[{i}]: {mm.get('basename')}" for i, mm in enumerate(metas)]
-        cols = ', '.join(f"{get_column_letter(i + 1)}:{h}" for i, h in enumerate(headers) if h)
-        parts.append(f"列结构: {cols}")
-        return '\n'.join(parts)
 
     def call_dify_intent(state):
         logs = list(state.get('logs') or [])
         api_url = app.agent_api_url_entry.get().strip()
         api_key = app.agent_api_key_entry.get().strip()
         col_struct = _column_structure_text(state.get('file_metadata') or [])
-        prompt = INTENT_PROMPT_TEMPLATE.format(column_structure=col_struct, request=state['user_request'])
+        history_section = _format_history_section(state.get('conversation') or [])
+        prompt = INTENT_PROMPT_TEMPLATE.format(
+            column_structure=col_struct, request=state['user_request'], history_section=history_section)
         answer = app.call_intent_api(api_url, api_key, prompt)
-        logs.append(f"意图返回: {answer[:200]}")
-        task, params = app.parse_intent_response(answer)
+        logs.append(f"意图返回(完整): {answer}")
+        meta = app.parse_intent_meta(answer)
+        task, params = meta['task'], meta['params']
         if task == 'custom':
             intent = {'task': 'custom', 'params': params, 'can_use_builtin_tool': False,
-                      'reason': params.get('reason', '')}
+                      'reason': meta.get('reason', '')}
         else:
             intent = {'task': task, 'params': params, 'can_use_builtin_tool': True}
+        # 新增：理解复述与澄清问题（Agent Loop ①/② 的数据来源）
+        intent['understanding'] = meta.get('understanding', '')
+        intent['clarify_questions'] = meta.get('clarify_questions', [])
+        intent['raw_answer'] = answer  # 原始返回存入状态（供交互区/落盘）
+        if meta.get('truncated'):
+            logs.append("⚠ 意图识别返回疑似被截断（JSON不完整），建议检查 Dify 意图应用 LLM 节点 max_tokens 或回答节点输出")
         logs.append(f"意图识别: {task} params={json.dumps(params, ensure_ascii=False)}")
         return {'intent': intent, 'logs': logs}
+
+    def decide_clarify(state):
+        """Loop①条件路由：有澄清问题且尚未回答 → 进入澄清中断；否则继续到理解确认"""
+        questions = (state.get('intent') or {}).get('clarify_questions') or []
+        rounds = state.get('clarify_rounds') or 0
+        if questions and not state.get('clarify_answers') and rounds < 3:
+            return 'clarify'
+        return 'proceed'
+
+    def clarify_interrupt(state):
+        """Loop①中断：暂停图执行，等待用户逐题回答澄清问题；恢复时写入 clarify_answers"""
+        questions = (state.get('intent') or {}).get('clarify_questions') or []
+        logs = list(state.get('logs') or [])
+        logs.append(f"需要澄清 {len(questions)} 个问题，等待用户回答")
+        answers = interrupt({'type': 'clarify', 'questions': questions})
+        if not isinstance(answers, dict):
+            answers = {}
+        logs.append("已收到用户澄清回答")
+        return {'clarify_answers': answers, 'clarify_rounds': (state.get('clarify_rounds') or 0) + 1,
+                'status': 'planning', 'logs': logs}
+
+    def update_context(state):
+        """合并澄清答案 / 用户修正进 user_request（作为 Context 的一部分），并清空一次性状态"""
+        logs = list(state.get('logs') or [])
+        answers = state.get('clarify_answers') or {}
+        revision = state.get('user_revision') or ''
+        parts = [state.get('user_request', '')]
+        if answers:
+            parts.append('补充信息：' + '；'.join(f'{q}：{a}' for q, a in answers.items() if a))
+        if revision:
+            parts.append('用户修正：' + revision)
+        merged = '\n'.join(parts).strip()
+        logs.append("已更新需求上下文（含澄清/修正信息），重新分析需求")
+        return {'user_request': merged, 'clarify_answers': None, 'user_revision': None, 'logs': logs}
+
+    def show_understanding(state):
+        """Loop②理解确认：展示 Agent 对需求的理解复述，中断等待用户确认/修正"""
+        # 已确认过理解（如澄清第二轮回来）则直接放行，避免重复确认
+        if state.get('understanding_ok'):
+            return {'status': 'planning'}
+        understanding = (state.get('intent') or {}).get('understanding') or ''
+        # 兜底：understanding 为空（如 Dify 返回截断/旧格式）时用需求文本展示，避免空白
+        if not understanding:
+            understanding = f"根据你的需求处理文件：{state.get('user_request', '')[:120]}"
+        logs = list(state.get('logs') or [])
+        if understanding:
+            logs.append(f"我的理解：{understanding}")
+        resp = interrupt({'type': 'understanding', 'text': understanding})
+        resp = resp or {}
+        ok = bool(resp.get('ok', True))
+        revision = str(resp.get('revision') or '').strip()
+        result = {'understanding': understanding, 'understanding_ok': ok,
+                  'status': 'planning', 'logs': logs}
+        if not ok and revision:
+            result['user_revision'] = revision
+        return result
+
+    def decide_understanding(state):
+        """Loop②条件路由：理解正确 → planner；用户修正 → 重新理解"""
+        if state.get('understanding_ok'):
+            return 'proceed'
+        return 'revision' if state.get('user_revision') else 'proceed'
 
     def planner(state):
         logs = list(state.get('logs') or [])
@@ -1040,14 +1322,29 @@ def build_agent_graph(app):
                     'params': {}, 'risk_level': 'medium', 'need_confirmation': True}
         else:
             meta = TOOL_REGISTRY.get(task, {})
+            params = intent.get('params') or {}
+            ok, missing = validate_tool_params(task, params)
+            if not ok:
+                # 参数缺失 → 注入澄清问题，路由回澄清循环
+                logs.append(f"计划: 参数不完整（{'; '.join(missing)}），需要用户澄清")
+                return {
+                    'plan': {'goal': meta.get('description', task), 'strategy': 'builtin', 'tool': task,
+                             'params': params, 'risk_level': meta.get('risk_level', 'low'),
+                             'need_confirmation': True, 'param_missing': True},
+                    'intent': {**intent, 'clarify_questions': missing},
+                    'logs': logs,
+                }
             plan = {'goal': meta.get('description', task), 'strategy': 'builtin', 'tool': task,
-                    'params': intent.get('params') or {}, 'risk_level': meta.get('risk_level', 'low'),
+                    'params': params, 'risk_level': meta.get('risk_level', 'low'),
                     'need_confirmation': True}
         logs.append(f"计划: strategy={plan['strategy']} tool={plan['tool']}")
         return {'plan': plan, 'logs': logs}
 
     def route_task(state):
-        return {'route': 'builtin' if state['plan']['strategy'] == 'builtin' else 'dynamic_code'}
+        plan = state.get('plan') or {}
+        if plan.get('param_missing'):
+            return {'route': 'clarify'}
+        return {'route': 'builtin' if plan.get('strategy') == 'builtin' else 'dynamic_code'}
 
     def execute_builtin(state):
         logs = list(state.get('logs') or [])
@@ -1148,7 +1445,16 @@ def build_agent_graph(app):
         logs = list(state.get('logs') or [])
         valid, issues = validate_generated_code(state.get('generated_code', ''))
         logs.append(f"代码校验: {'通过' if valid else '拒绝 ' + '; '.join(issues[:5])}")
-        return {'code_validation': {'valid': valid, 'issues': issues}, 'logs': logs}
+        result = {'code_validation': {'valid': valid, 'issues': issues}, 'logs': logs}
+        if not valid:
+            # 注入拒绝原因（含软提示，供校验拒绝后的自动重生成反馈给 Dify）
+            result['repair_feedback'] = '代码校验未通过：' + '；'.join(issues[:5])
+        else:
+            # 校验通过但存在软提示（如相对路径保存）→ 日志提示
+            for h in issues:
+                if h.startswith('[提示]'):
+                    logs.append(f"提示: {h}")
+        return result
 
     def sandbox_execute(state):
         logs = list(state.get('logs') or [])
@@ -1163,7 +1469,12 @@ def build_agent_graph(app):
             for o in outputs:
                 logs.append(f"输出: {o}")
             return {'execution_result': {'ok': True}, 'output_files': outputs, 'logs': logs}
-        return {'execution_result': {'ok': False}, 'error': log[:500], 'logs': logs, 'status': 'failed'}
+        # 失败时附带代码摘要（前 8 行），便于人工排查
+        code_head = '\n'.join((state.get('generated_code') or '').splitlines()[:8])
+        if code_head:
+            logs.append(f"代码摘要(前8行): {code_head[:500]}")
+        return {'execution_result': {'ok': False, 'log': log}, 'error': log[:500],
+                'logs': logs, 'status': 'failed'}
 
     def code_rejected(state):
         logs = list(state.get('logs') or [])
@@ -1171,9 +1482,149 @@ def build_agent_graph(app):
         logs.append(f"代码被拒绝，不执行: {'; '.join(issues[:5])}")
         return {'logs': logs, 'status': 'failed'}
 
+    def verify_result(state):
+        """Loop③结果自检：结构化校验（存在/可打开/非空）+ 语义反思（LLM，失败时降级）"""
+        logs = list(state.get('logs') or [])
+        checks = []
+        outputs = state.get('output_files') or []
+        for o in outputs:
+            passed = os.path.exists(o)
+            detail = '存在'
+            if passed:
+                try:
+                    t = detect_file_type(o)
+                    if t in ('xlsx', 'xls'):
+                        wb = load_workbook(o, read_only=True)
+                        rows = wb.active.max_row
+                        wb.close()
+                        passed = rows > 0
+                        detail = f'可打开, {rows}行'
+                    elif t == 'csv':
+                        with open(o, encoding='utf-8-sig', errors='replace') as fh:
+                            rows = sum(1 for _ in fh)
+                        passed = rows > 0
+                        detail = f'CSV {rows}行'
+                    else:
+                        detail = f'{os.path.getsize(o)}字节'
+                except Exception as e:
+                    passed = False
+                    detail = f'打不开: {str(e)}'
+            checks.append({'name': os.path.basename(o), 'passed': passed, 'detail': detail})
+        if not outputs:
+            checks.append({'name': '输出文件', 'passed': False, 'detail': '无输出文件'})
+        structural_ok = all(c['passed'] for c in checks)
+        # 语义反思：有输出文件才做（无输出时反思无意义，结构化失败已足够触发修复）
+        reflection = None
+        if not outputs:
+            logs.append("无输出文件，跳过语义反思（结构化校验失败即可触发修复）")
+        else:
+            try:
+                api_url = app.agent_api_url_entry.get().strip()
+                api_key = app.agent_api_key_entry.get().strip()
+                if api_url and api_key:
+                    reflection = app.call_reflection_api(
+                        api_url, api_key,
+                        user_request=state.get('user_request', ''),
+                        input_meta=json.dumps([{k: v for k, v in m.items() if k != 'path'}
+                                               for m in (state.get('file_metadata') or [])], ensure_ascii=False),
+                        output_meta=json.dumps(collect_output_meta(outputs), ensure_ascii=False),
+                        output_summary='\n'.join(os.path.basename(o) for o in outputs),
+                    )
+            except Exception as e:
+                logs.append(f"反思API调用失败（降级为仅结构化校验）: {str(e)}")
+        ok = structural_ok and (reflection is None or reflection.get('satisfied', True))
+        reason = '' if ok else (reflection.get('reason', '') if reflection else '结构化校验未通过')
+        suggestions = (reflection or {}).get('suggestions', '')
+        # 结构化校验失败时拼入沙箱诊断（帮助修复循环定位问题，如"无输出/残留文件"）
+        exec_log = (state.get('execution_result') or {}).get('log') or ''
+        if not ok and exec_log and '生成任何文件' in exec_log:
+            suggestions = (suggestions + ' ' if suggestions else '') + f"沙箱诊断: {exec_log[:500]}"
+        # 无输出/无建议时给默认建议，确保修复循环仍可触发
+        if not ok and not suggestions:
+            if not outputs:
+                suggestions = ("代码未生成任何输出文件，请检查读取（os.environ['INPUT_DIR']）与写入"
+                               "（os.environ['OUTPUT_DIR']）路径，确保代码执行到保存步骤")
+            else:
+                suggestions = "输出文件存在但未满足需求，请调整处理逻辑"
+        logs.append(f"结果自检: {'通过' if ok else '未通过'} - {reason}")
+        # 落盘 verify 记录（每轮修复各记一条）
+        try:
+            app._agent_write_log(state.get('task_id', ''), 'verify', {
+                'round': state.get('repair_rounds') or 0,
+                'ok': ok,
+                'reason': reason,
+                'checks': checks,
+                'suggestions': suggestions,
+            })
+        except Exception:
+            pass
+        return {
+            'verification': {'ok': ok, 'reason': reason, 'suggestions': suggestions, 'checks': checks},
+            'repair_feedback': suggestions,
+            'logs': logs,
+        }
+
+    def decide_verify(state):
+        """Loop③条件路由：满足 → 总结；dynamic 未达上限且有建议 → 修复重入；否则 → verify_failed"""
+        v = state.get('verification') or {}
+        if v.get('ok'):
+            return 'satisfied'
+        route = state.get('route')
+        rounds = state.get('repair_rounds') or 0
+        max_r = state.get('max_repair_rounds') or 2
+        if route == 'dynamic_code' and rounds < max_r and v.get('suggestions'):
+            return 'repair'
+        return 'verify_failed'
+
+    def reflect_regenerate(state):
+        """Loop③修复节点：携带反思意见 + 上一轮代码重新生成，repair_rounds 递增"""
+        logs = list(state.get('logs') or [])
+        api_url = app.agent_codegen_url_entry.get().strip()
+        api_key = app.agent_codegen_key_entry.get().strip()
+        if not api_url or not api_key:
+            logs.append("代码生成 API 未配置，无法自动修复")
+            return {'logs': logs, 'status': 'failed', 'error': '代码生成 API 未配置'}
+        feedback = state.get('repair_feedback') or ''
+        user_request = state['user_request']
+        req = user_request + f"\n（上一轮结果未满足需求，改进意见：{feedback}）" if feedback else user_request
+        meta_safe = []
+        for m in state.get('file_metadata') or []:
+            safe = {k: v for k, v in m.items() if k != 'path'}
+            safe['path'] = '<input_dir>/' + os.path.basename(m.get('path') or '')
+            meta_safe.append(safe)
+        file_metadata = json.dumps(meta_safe, ensure_ascii=False)
+        sample_rows = _read_sample_rows(state)
+        try:
+            result = app.call_code_generator_api(
+                api_url, api_key, req, file_metadata, sample_rows, EXECUTION_CONSTRAINTS,
+                previous_code=state.get('generated_code', ''))
+            code = str(result.get('code', '') or '')
+            if not code:
+                logs.append("修复代码生成为空")
+                return {'logs': logs, 'status': 'failed', 'error': '修复代码生成为空'}
+            logs.append(f"第{(state.get('repair_rounds') or 0) + 1}轮修复代码生成成功")
+            return {
+                'generated_code': code,
+                'code_description': str(result.get('description', '') or ''),
+                'repair_rounds': (state.get('repair_rounds') or 0) + 1,
+                'logs': logs,
+            }
+        except Exception as e:
+            logs.append(f"修复代码生成失败: {str(e)}")
+            return {'logs': logs, 'status': 'failed', 'error': str(e)}
+
+    def verify_failed(state):
+        logs = list(state.get('logs') or [])
+        v = state.get('verification') or {}
+        logs.append(f"结果未通过自检: {v.get('reason', '')}")
+        return {'logs': logs, 'status': 'failed'}
+
     builder = StateGraph(FileAgentState)
     builder.add_node('inspect_files', inspect_files)
     builder.add_node('call_dify_intent', call_dify_intent)
+    builder.add_node('clarify_interrupt', clarify_interrupt)
+    builder.add_node('update_context', update_context)
+    builder.add_node('show_understanding', show_understanding)
     builder.add_node('planner', planner)
     builder.add_node('route_task', route_task)
     builder.add_node('execute_builtin', execute_builtin)
@@ -1183,25 +1634,53 @@ def build_agent_graph(app):
     builder.add_node('validate_code', validate_code)
     builder.add_node('sandbox_execute', sandbox_execute)
     builder.add_node('code_rejected', code_rejected)
+    builder.add_node('verify_result', verify_result)
+    builder.add_node('reflect_regenerate', reflect_regenerate)
+    builder.add_node('verify_failed', verify_failed)
     builder.add_edge(START, 'inspect_files')
     builder.add_edge('inspect_files', 'call_dify_intent')
-    builder.add_edge('call_dify_intent', 'planner')
+    # Loop①：澄清循环（decide_clarify 为条件路由函数，重入 call_dify_intent）
+    builder.add_conditional_edges(
+        'call_dify_intent',
+        decide_clarify,
+        {'clarify': 'clarify_interrupt', 'proceed': 'show_understanding'},
+    )
+    builder.add_edge('clarify_interrupt', 'update_context')
+    builder.add_edge('update_context', 'call_dify_intent')
+    # Loop②：理解确认循环（用户修正 → 重入 call_dify_intent）
+    builder.add_conditional_edges(
+        'show_understanding',
+        decide_understanding,
+        {'proceed': 'planner', 'revision': 'update_context'},
+    )
     builder.add_edge('planner', 'route_task')
     builder.add_conditional_edges(
         'route_task',
         lambda s: s.get('route', 'builtin'),
-        {'builtin': 'execute_builtin', 'dynamic_code': 'generate_code'},
+        {'builtin': 'execute_builtin', 'dynamic_code': 'generate_code', 'clarify': 'clarify_interrupt'},
     )
     builder.add_edge('generate_code', 'validate_code')
+    # 校验拒绝 → 自动重生成（repair_rounds 未达上限且有拒绝原因）；达上限/无原因 → code_rejected 安全终止
     builder.add_conditional_edges(
         'validate_code',
-        lambda s: 'sandbox_execute' if (s.get('code_validation') or {}).get('valid') else 'code_rejected',
-        {'sandbox_execute': 'sandbox_execute', 'code_rejected': 'code_rejected'},
+        lambda s: (
+            'sandbox_execute' if (s.get('code_validation') or {}).get('valid')
+            else ('repair' if (s.get('repair_rounds') or 0) < (s.get('max_repair_rounds') or 2)
+                  and (s.get('code_validation') or {}).get('issues') else 'rejected')),
+        {'sandbox_execute': 'sandbox_execute', 'repair': 'reflect_regenerate', 'rejected': 'code_rejected'},
     )
     builder.add_edge('code_rejected', END)
     builder.add_edge('execute_builtin', 'validate_output')
     builder.add_edge('sandbox_execute', 'validate_output')
-    builder.add_edge('validate_output', 'result_summary')
+    # Loop③：结果自检与修复循环（dynamic 未达上限 → 重新生成代码重入）
+    builder.add_edge('validate_output', 'verify_result')
+    builder.add_conditional_edges(
+        'verify_result',
+        decide_verify,
+        {'satisfied': 'result_summary', 'repair': 'reflect_regenerate', 'verify_failed': 'verify_failed'},
+    )
+    builder.add_edge('reflect_regenerate', 'validate_code')
+    builder.add_edge('verify_failed', END)
     builder.add_edge('result_summary', END)
     return builder.compile(checkpointer=InMemorySaver())
 
@@ -1216,8 +1695,10 @@ EXECUTION_CONSTRAINTS = (
     "只能操作系统分配的工作目录；只能读取 INPUT_DIR 中的输入文件；只能写入 OUTPUT_DIR。"
     "必须至少生成 1 个输出文件到 OUTPUT_DIR；禁止只打印统计结果而不落盘。"
     "脚本结束前必须 print 生成的输出文件名或输出路径，便于日志排查。"
+    "必须在顶层直接执行处理逻辑，或在文件末尾调用你定义的入口函数（如 process_excel()），不要只定义函数不调用；"
     "禁止网络访问；禁止 subprocess/os.system/shell；禁止删除文件；禁止覆盖原文件；"
-    "禁止读取环境变量中的密钥；禁止访问 HOME 目录；禁止 pip install；禁止 eval/exec；"
+    "禁止读取环境变量中的密钥；禁止访问 HOME 目录；禁止 pip install；"
+    "禁止 eval/exec/compile 及任何形式的动态执行（exec/eval/compile/__import__）；"
     "必须使用确定性的文件处理逻辑；优先使用 openpyxl/csv/json/pathlib/re/datetime，只有在明显更合适时才使用 pandas。"
 )
 
@@ -1247,9 +1728,28 @@ def _call_name(node):
     return None
 
 
+def _has_top_level_execution(tree):
+    """判断代码顶层是否有实际执行语句（顶层直接调用 或 if __name__ == '__main__' 块）"""
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            return True
+        if isinstance(stmt, ast.If):
+            test = stmt.test
+            if (isinstance(test, ast.Compare) and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Constant)
+                    and test.comparators[0].value == '__main__'):
+                return True
+    return False
+
+
 def validate_generated_code(code):
-    """AST 静态校验生成代码；返回 (valid, issues列表)"""
-    issues = []
+    """AST 静态校验生成代码；返回 (valid, issues列表)。
+
+    - valid: 是否存在硬性问题（导入黑名单/危险调用/危险属性/可疑字符串）
+    - issues: 硬性问题 + 软提示（软提示带 [提示] 前缀，不导致拒绝，供修复反馈参考）
+    """
+    hard_issues = []
+    hints = []
     if not code or not code.strip():
         return False, ['代码为空']
     try:
@@ -1260,26 +1760,44 @@ def validate_generated_code(code):
         if isinstance(node, ast.Import):
             for a in node.names:
                 if a.name.split('.')[0] in FORBIDDEN_IMPORTS:
-                    issues.append(f"禁止导入: {a.name}")
+                    hard_issues.append(f"禁止导入: {a.name}")
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.module.split('.')[0] in FORBIDDEN_IMPORTS:
-                issues.append(f"禁止导入: {node.module}")
+                hard_issues.append(f"禁止导入: {node.module}")
         elif isinstance(node, ast.Call):
             fname = _call_name(node.func)
             if fname in FORBIDDEN_NAMES:
-                issues.append(f"禁止调用: {fname}")
+                hard_issues.append(f"禁止调用: {fname}")
             if fname and (fname.endswith('system') or fname.endswith('popen')):
-                issues.append(f"禁止调用: {fname}")
+                hard_issues.append(f"禁止调用: {fname}")
+            # 软提示：save/to_excel/to_csv 使用字面量相对路径（不拒绝，供修复反馈）
+            if fname in ('save', 'to_excel', 'to_csv'):
+                target = node.args[0] if node.args else None
+                if isinstance(target, ast.Constant) and isinstance(target.value, str):
+                    p = target.value
+                    if not os.path.isabs(p) and 'OUTPUT_DIR' not in p and 'output' not in p.lower():
+                        hints.append(f"[提示] 输出路径疑似未使用OUTPUT_DIR（相对路径保存）: {p}")
         elif isinstance(node, ast.Attribute):
             if node.attr in FORBIDDEN_ATTRS:
-                issues.append(f"禁止属性: {node.attr}")
+                hard_issues.append(f"禁止属性: {node.attr}")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             low = node.value.lower()
             for pat in SUSPICIOUS_PATTERNS:
                 if pat in low:
-                    issues.append(f"可疑字符串: {node.value[:50]}")
+                    hard_issues.append(f"可疑字符串: {node.value[:50]}")
                     break
-    return len(issues) == 0, issues
+        elif isinstance(node, ast.Try):
+            # 空 except 块（仅 pass / 空）→ 吞异常，禁止（异常必须暴露以便诊断）
+            for handler in node.handlers:
+                body = handler.body or []
+                if not body or all(isinstance(st, ast.Pass) for st in body):
+                    hard_issues.append("禁止空except吞异常（except 块必须 print 异常或 raise，异常必须暴露）")
+    # 软提示：顶层只有函数定义、无实际调用 → 处理逻辑可能不执行
+    has_func = any(isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) for s in tree.body)
+    if has_func and not _has_top_level_execution(tree):
+        hints.append("[提示] 代码仅在顶层定义了函数但未调用，处理逻辑可能不会执行；"
+                     "请在末尾添加入口函数调用（如 process_excel()）")
+    return len(hard_issues) == 0, hard_issues + hints
 
 
 def _sandbox_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -1290,10 +1808,39 @@ def _sandbox_import(name, globals=None, locals=None, fromlist=(), level=0):
     allowed_roots = {
         'os', 'json', 'csv', 're', 'math', 'statistics',
         'pathlib', 'datetime', 'pandas', 'openpyxl',
+        'shutil', 'time',
     }
     if root not in allowed_roots:
         raise ImportError(f"未允许的导入: {name}")
     return __import__(name, globals, locals, fromlist, level)
+
+
+def _install_timeout(timeout):
+    """Unix 主线程上安装 SIGALRM 超时；非主线程（signal.signal 受限）或 Windows 无信号支持则跳过。
+
+    返回是否已安装。GUI 后台线程场景返回 False（超时不生效，与旧版行为一致）。
+    """
+    import signal
+    import threading
+    if (timeout and timeout > 0 and hasattr(signal, 'SIGALRM')
+            and threading.current_thread() is threading.main_thread()):
+        def _handler(signum, frame):
+            raise TimeoutError(f"沙箱执行超过 {timeout} 秒，已终止")
+        signal.signal(signal.SIGALRM, _handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        return True
+    return False
+
+
+def _clear_timeout(installed):
+    """清除 SIGALRM 定时器并恢复默认处理。"""
+    import signal
+    if installed:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        except Exception:
+            pass
 
 
 def _sandbox_builtins():
@@ -1435,6 +1982,13 @@ def _runtime_log(msg):
         pass
 
 
+# 沙箱工作区内系统文件（残留检测时排除，避免误报为动态代码写入）
+_SANDBOX_SYSTEM_FILES = {'script.py', 'execution.log', 'metadata.json'}
+
+# 动态代码常见入口函数名（沙箱按优先级自动调用第一个可调用者；main 优先）
+_ENTRY_FUNCTION_NAMES = ('main', 'process_excel', 'process', 'run', 'execute', 'handle')
+
+
 def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
     """受限执行生成代码：隔离工作区 + 环境白名单；返回 (ok, log, output_files)"""
     ws_dir = os.path.join(_resolve_agent_workspace_root(), task_id)
@@ -1464,6 +2018,7 @@ def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
         'PYTHONPATH': '',
         'LANG': 'en_US.UTF-8',
     }
+    timeout_active = False
     try:
         old_cwd = os.getcwd()
         old_env = {k: os.environ.get(k) for k in env}
@@ -1476,12 +2031,20 @@ def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
         try:
             os.chdir(ws_dir)
             os.environ.update(env)
+            timeout_active = _install_timeout(timeout)
             with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stdout_buffer):
                 exec(compiled, sandbox_globals, sandbox_globals)
-                maybe_main = sandbox_globals.get('main')
-                if callable(maybe_main):
-                    maybe_main()
+                # 自动调用入口函数（main 优先，其次常见入口名；LLM 常把逻辑包在函数里只定义不调用）
+                entry_name = None
+                for name in _ENTRY_FUNCTION_NAMES:
+                    candidate = sandbox_globals.get(name)
+                    if callable(candidate):
+                        entry_name = name
+                        break
+                if entry_name:
+                    sandbox_globals[entry_name]()
         finally:
+            _clear_timeout(timeout_active)
             os.chdir(old_cwd)
             for key, value in old_env.items():
                 if value is None:
@@ -1493,6 +2056,22 @@ def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
                    if os.path.isfile(os.path.join(out_ws, n))]
         if not outputs:
             detail = log or "动态代码执行完成，但没有在 OUTPUT_DIR 中生成任何文件"
+            # 诊断：检查沙箱工作目录（chdir 目标）是否有代码写入的残留文件（相对路径保存的证据），排除系统文件
+            leftovers = [n for n in os.listdir(ws_dir)
+                         if os.path.isfile(os.path.join(ws_dir, n)) and n not in _SANDBOX_SYSTEM_FILES]
+            if leftovers:
+                detail += (f"；检测到代码可能写入了工作目录而非 OUTPUT_DIR（残留文件: {', '.join(leftovers[:5])}）。"
+                           "请通过 os.environ['OUTPUT_DIR'] 拼接输出路径，例如 "
+                           "output_path = os.path.join(os.environ['OUTPUT_DIR'], '结果.xlsx')")
+            elif not log:
+                # 无残留且无 stdout → 代码未执行到写入步骤（如读取输入失败被 try/except 吞掉）
+                detail += ("；脚本未执行到写入步骤（无输出文件、无残留文件、无 stdout）。"
+                           "常见原因：读取输入文件失败被 try/except 吞掉。"
+                           "请用 os.path.join(os.environ['INPUT_DIR'], '输入文件名') 读取输入，"
+                           "用 os.path.join(os.environ['OUTPUT_DIR'], '结果.xlsx') 保存输出，"
+                           "且代码末尾必须 print 输出文件名、不要用 try/except 吞掉异常")
+            elif not log:
+                detail += "；脚本未输出任何 stdout，请确保代码末尾 print 输出文件名"
             return False, detail, []
         final_outputs = []
         for o in outputs:
@@ -1500,7 +2079,11 @@ def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
             shutil.copy2(o, dest)
             final_outputs.append(dest)
         return True, log, final_outputs
+    except TimeoutError as e:
+        _clear_timeout(timeout_active)
+        return False, f"执行超时: {str(e)}", []
     except Exception as e:
+        _clear_timeout(timeout_active)
         return False, f"执行异常: {str(e)}", []
 
 
@@ -2227,6 +2810,11 @@ class ExcelProcessorApp:
         # 懒加载 Agent 图：避免 GUI 启动阶段被 LangGraph 依赖链阻塞
         self.agent_graph = None
         self.agent_graph_error = None
+        # Agent Loop 交互状态（澄清/理解确认/结果反馈）
+        self.agent_phase = 'idle'          # idle / analyze / clarify / understanding / confirm / executing / feedback
+        self.agent_conversation = []       # 多轮对话历史（跨轮 Context）
+        self.agent_clarify_questions = []  # 当前待澄清问题
+        self.agent_last_summary = ''       # 上一轮结果摘要（供反馈循环）
 
         # 1. 文件选择区
         file_frame = ttk.LabelFrame(scrollable_frame, text="文件选择", padding=10)
@@ -2283,6 +2871,22 @@ class ExcelProcessorApp:
         self.agent_confirm_btn.pack(side=tk.LEFT, padx=5)
         self.agent_cancel_btn = ttk.Button(action_frame, text="取消", command=self.agent_cancel_plan, state=tk.DISABLED)
         self.agent_cancel_btn.pack(side=tk.LEFT, padx=5)
+
+        # 4.5 交互区（澄清回答 / 理解确认 / 结果反馈，按需显隐）
+        interact_frame = ttk.LabelFrame(scrollable_frame, text="Agent 交互", padding=10)
+        interact_frame.pack(fill=tk.X, padx=10, pady=5)
+        # 澄清行
+        self.agent_clarify_label = ttk.Label(interact_frame, text="", wraplength=680)
+        self.agent_clarify_entry = ttk.Entry(interact_frame, width=80)
+        self.agent_clarify_submit_btn = ttk.Button(interact_frame, text="提交回答", command=self._submit_clarify)
+        # 理解确认行
+        self.agent_understand_label = ttk.Label(interact_frame, text="", wraplength=680)
+        self.agent_understand_ok_btn = ttk.Button(interact_frame, text="理解正确，继续", command=self._on_understand_ok)
+        self.agent_revise_btn = ttk.Button(interact_frame, text="修正需求", command=self._on_revise)
+        # 结果反馈行
+        self.agent_satisfied_btn = ttk.Button(interact_frame, text="结果满意", command=self._on_satisfied)
+        self.agent_feedback_btn = ttk.Button(interact_frame, text="提出修改意见", command=self._on_feedback_submit)
+        self._hide_interaction()
 
         # 5. 方案预览区
         plan_frame = ttk.LabelFrame(scrollable_frame, text="Agent 执行方案", padding=10)
@@ -2377,6 +2981,217 @@ class ExcelProcessorApp:
         else:
             self._stop_confirm_pulse()
 
+    # ---- Agent Loop 交互辅助（澄清 / 理解确认 / 结果反馈） ----
+
+    def _hide_interaction(self):
+        """隐藏交互区全部控件"""
+        for w in (self.agent_clarify_label, self.agent_clarify_entry, self.agent_clarify_submit_btn,
+                  self.agent_understand_label, self.agent_understand_ok_btn, self.agent_revise_btn,
+                  self.agent_satisfied_btn, self.agent_feedback_btn):
+            w.pack_forget()
+
+    def _pack_interaction(self, widgets, side=tk.TOP):
+        for w in widgets:
+            w.pack(side=side, padx=5, pady=2, fill=tk.X)
+
+    def _agent_task_id(self):
+        return (self.agent_thread_config or {}).get('configurable', {}).get('thread_id', '')
+
+    def _resume_graph(self, command=None):
+        """恢复图执行（澄清/理解确认用 Command(resume=...)，执行确认用 None），并继续处理阶段1"""
+        if not self._ensure_agent_graph():
+            return
+        self.agent_running = True
+
+        def worker():
+            try:
+                partial = self.agent_graph.invoke(
+                    command, config=self.agent_thread_config,
+                    interrupt_before=["execute_builtin", "sandbox_execute"])
+                self._handle_stage1(partial)
+            except Exception as e:
+                self.agent_log(f"✗ 处理失败: {str(e)}")
+                self._agent_set_plan(f"处理失败: {str(e)}", False)
+            finally:
+                self.agent_running = False
+                self.agent_analyze_btn.config(state=tk.NORMAL)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _file_structure_text(self, partial):
+        """生成文件列结构文本（供澄清/理解确认展示），无元数据时返回空串"""
+        metas = partial.get('file_metadata') or []
+        if not metas:
+            return ''
+        return _column_structure_text(metas)
+
+    def _intent_friendly_text(self, partial):
+        """将意图识别结果整理为运维可读的自然语言文本（替代原始 JSON 展示）"""
+        intent = partial.get('intent') or {}
+        task = intent.get('task', '')
+        params = intent.get('params') or {}
+        understanding = intent.get('understanding') or ''
+        reason = intent.get('reason') or ''
+        questions = intent.get('clarify_questions') or []
+        lines = []
+        # 需求理解（兜底：custom 用 reason，否则用需求文本）
+        if not understanding:
+            understanding = reason or f"根据你的需求处理文件：{(partial.get('user_request') or '')[:120]}"
+        lines.append(f"需求理解：{understanding}")
+        # 识别结果
+        if task == 'custom':
+            lines.append(f"识别结果：内置工具无法直接满足（{reason or '需要自定义处理'}）")
+        else:
+            desc = TOOL_REGISTRY.get(task, {}).get('description', task)
+            lines.append(f"识别结果：{task}（{desc}）")
+            if params:
+                lines.append(f"参数：{json.dumps(params, ensure_ascii=False)}")
+        # 待澄清问题
+        if questions:
+            lines.append('待澄清问题：')
+            for i, q in enumerate(questions, 1):
+                lines.append(f"  {i}. {q}")
+        return '\n'.join(lines)
+
+    def _show_clarify(self, partial, questions):
+        """Loop①澄清交互：展示友好意图结果 + 文件列结构 + 澄清问题，等待用户逐题回答（多题用 | 分隔）"""
+        self.agent_phase = 'clarify'
+        self.agent_clarify_questions = questions
+        lines = [self._intent_friendly_text(partial), '']
+        col_text = self._file_structure_text(partial)
+        if col_text:
+            lines += ['文件列结构：', col_text, '']
+        lines.append('需要你补充以下信息：')
+        for i, q in enumerate(questions, 1):
+            lines.append(f"{i}. {q}")
+        lines.append('')
+        lines.append('请在上方输入框填写回答；多个问题请用 | 分隔，然后点击「提交回答」。')
+        self._agent_set_plan('\n'.join(lines), False)
+        self.agent_clarify_label.config(text='你的回答（多个问题用 | 分隔）：')
+        self.agent_clarify_entry.delete(0, tk.END)
+        self._pack_interaction([self.agent_clarify_label, self.agent_clarify_entry, self.agent_clarify_submit_btn])
+
+    def _submit_clarify(self):
+        """用户提交澄清回答 → 带值恢复图执行"""
+        from langgraph.types import Command
+        if self.agent_phase != 'clarify':
+            return
+        raw = self.agent_clarify_entry.get().strip()
+        questions = self.agent_clarify_questions
+        if not questions:
+            return
+        if len(questions) > 1 and '|' not in raw:
+            messagebox.showwarning("警告", f"有 {len(questions)} 个问题需要回答，请用 | 分隔多个回答")
+            return
+        parts = [p.strip() for p in raw.split('|')] if raw else ['']
+        while len(parts) < len(questions):
+            parts.append('')
+        answers = {q: (parts[i] if i < len(parts) else '') for i, q in enumerate(questions)}
+        self.agent_log("用户提交澄清回答，重新分析需求")
+        self._agent_write_log(self._agent_task_id(), 'clarify', {'questions': questions, 'answers': answers})
+        self._hide_interaction()
+        self.agent_phase = 'analyze'
+        self._resume_graph(Command(resume=answers))
+
+    def _show_understanding_wait(self, partial, understanding):
+        """Loop②理解确认交互：展示友好意图结果 + 文件列结构，等待用户确认/修正"""
+        self.agent_phase = 'understanding'
+        self.agent_log("需要你确认对需求的理解是否正确")
+        text = self._intent_friendly_text(partial)
+        col_text = self._file_structure_text(partial)
+        if col_text:
+            text += f"\n\n文件列结构：\n{col_text}"
+        text += "\n\n请确认理解是否正确，或点击「修正需求」补充信息。"
+        self._agent_set_plan(text, False)
+        self.agent_understand_label.config(text=f"我的理解：{understanding}")
+        self._pack_interaction([self.agent_understand_label, self.agent_understand_ok_btn, self.agent_revise_btn])
+
+    def _on_understand_ok(self):
+        """用户确认理解正确 → 继续规划"""
+        from langgraph.types import Command
+        if self.agent_phase != 'understanding':
+            return
+        self.agent_log("用户确认理解正确")
+        self._agent_write_log(self._agent_task_id(), 'understanding', {'ok': True})
+        self._hide_interaction()
+        self.agent_phase = 'analyze'
+        self._resume_graph(Command(resume={'ok': True}))
+
+    def _on_revise(self):
+        """用户修正需求 → 带着修正重新理解（Loop②重入）"""
+        from langgraph.types import Command
+        if self.agent_phase != 'understanding':
+            return
+        revision = simpledialog.askstring("修正需求", "请补充或修正你的需求：", parent=self.root)
+        if revision is None:
+            return
+        revision = revision.strip()
+        self._hide_interaction()
+        self.agent_log(f"用户修正需求: {revision[:120]}")
+        self._agent_write_log(self._agent_task_id(), 'understanding', {'ok': False, 'revision': revision})
+        if not revision:
+            # 修正为空 → 视为确认理解，按原需求继续
+            self.agent_phase = 'analyze'
+            self._resume_graph(Command(resume={'ok': True}))
+            return
+        self.agent_phase = 'analyze'
+        self._resume_graph(Command(resume={'ok': False, 'revision': revision}))
+
+    def _show_feedback(self, final):
+        """Loop④结果反馈：展示结果摘要 + 自检结论，等待用户满意/提出修改意见"""
+        self.agent_phase = 'feedback'
+        status = final.get('status', 'done')
+        lines = []
+        if status == 'failed':
+            lines.append("✗ 执行未完成")
+            lines.append(f"错误: {final.get('error', '未知错误')}")
+            lines.append("可点击「提出修改意见」重新分析，或修改需求后重试。")
+        else:
+            lines.append("✓ 执行完成")
+            for o in final.get('output_files') or []:
+                lines.append(f"输出: {o}")
+            v = final.get('verification') or {}
+            if v:
+                lines.append(f"结果自检: {'通过' if v.get('ok') else '未通过'} - {v.get('reason', '')}")
+                if not v.get('ok'):
+                    lines.append("若结果不符合预期，可点击「提出修改意见」，我将带着意见重新处理。")
+        self.agent_last_summary = '\n'.join(lines)
+        self._agent_set_plan('\n'.join(lines), False)
+        self._pack_interaction([self.agent_satisfied_btn, self.agent_feedback_btn], side=tk.LEFT)
+
+    def _on_satisfied(self):
+        """用户确认结果满意 → 结束本轮"""
+        if self.agent_phase != 'feedback':
+            return
+        self.agent_log("用户确认结果满意")
+        self._agent_write_log(self._agent_task_id(), 'feedback', {'satisfied': True})
+        self._hide_interaction()
+        self.agent_phase = 'idle'
+
+    def _on_feedback_submit(self):
+        """用户提出修改意见 → 带上下文启动新一轮分析（Loop④重入）"""
+        if self.agent_phase != 'feedback':
+            return
+        feedback = simpledialog.askstring("提出修改意见", "请描述需要修改的地方：", parent=self.root)
+        if feedback is None:
+            return
+        feedback = feedback.strip()
+        if not feedback:
+            return
+        self._hide_interaction()
+        self.agent_log(f"用户反馈: {feedback[:120]}，携带上下文重新分析")
+        self._agent_write_log(self._agent_task_id(), 'feedback', {'satisfied': False, 'feedback': feedback})
+        # 记录多轮上下文（供下一轮 prompt 注入）
+        self.agent_conversation.append({'role': 'assistant', 'content': self.agent_last_summary})
+        self.agent_conversation.append({'role': 'user', 'content': f"修改意见：{feedback}"})
+        self.agent_conversation = self.agent_conversation[-6:]  # 截断
+        # 需求框追加修改意见，供用户查看/编辑
+        current = self.agent_request_text.get('1.0', tk.END).strip()
+        self.agent_request_text.delete('1.0', tk.END)
+        self.agent_request_text.insert(tk.END, current + f"\n（修改意见：{feedback}）")
+        self.agent_phase = 'idle'
+        self.agent_analyze()
+
     # ---- 确认按钮呼吸灯闪烁 ----
 
     def _start_confirm_pulse(self):
@@ -2455,6 +3270,7 @@ class ExcelProcessorApp:
             'logs': [],
             'status': 'planning',
             'task_id': thread_id,
+            'conversation': list(self.agent_conversation),  # 多轮上下文（Loop④）
         }
 
         def worker():
@@ -2473,25 +3289,59 @@ class ExcelProcessorApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_stage1(self, partial):
-        """处理阶段1结果：输出日志、展示方案（builtin 或 dynamic）、启用/禁用确认"""
+        """处理阶段1结果：循环处理澄清/理解确认中断，最终展示方案或等待用户交互"""
+        from langgraph.types import Command
         for lg in partial.get('logs') or []:
             self.agent_log(lg)
+        snapshot = self.agent_graph.get_state(self.agent_thread_config)
+        next_nodes = tuple(snapshot.next or ())
+        intent = partial.get('intent') or {}
+        questions = intent.get('clarify_questions') or []
+        task = intent.get('task', '')
+        task_id = self._agent_task_id()
+        self._agent_write_log(task_id, 'stage1', {
+            'intent': intent,
+            'plan': partial.get('plan'),
+            'route': partial.get('route'),
+            'file_metadata': partial.get('file_metadata'),
+            'next': list(next_nodes),
+        })
+        if 'clarify_interrupt' in next_nodes:
+            # Loop①：需要澄清
+            self._show_clarify(partial, questions)
+            return
+        if 'show_understanding' in next_nodes:
+            # Loop②：理解确认
+            understanding = intent.get('understanding', '')
+            if not understanding:
+                # 兜底：截断/旧格式导致 understanding 缺失时用 reason 或需求文本
+                understanding = (intent.get('reason') or
+                                 f"根据你的需求处理文件：{(partial.get('user_request') or '')[:120]}")
+            self.agent_log(f"我的理解：{understanding}")
+            # 需求明确（无澄清问题、非 custom）→ 自动确认理解，继续规划
+            if not questions and task != 'custom':
+                self.agent_log("需求明确，理解确认通过，继续规划")
+                self._resume_graph(Command(resume={'ok': True}))
+                return
+            self._show_understanding_wait(partial, understanding)
+            return
+        # 已通过澄清/理解，停在执行前中断点（interrupt_before）→ 展示方案
+        self._show_plan_or_dynamic(partial)
+
+    def _show_plan_or_dynamic(self, partial):
+        """展示最终执行方案（builtin 或 dynamic_code），等待用户确认执行"""
         plan = partial.get('plan') or {}
         route = partial.get('route') or 'builtin'
         tool = plan.get('tool') or ''
         params = plan.get('params') or {}
-        task_id = (self.agent_thread_config or {}).get('configurable', {}).get('thread_id', '')
-        self._agent_write_log(task_id, 'stage1', {
-            'intent': partial.get('intent'),
-            'plan': plan,
-            'route': route,
-            'file_metadata': partial.get('file_metadata'),
-        })
         if route == 'dynamic_code' or tool == 'custom':
             self._show_dynamic_plan(partial)
             return
         self.agent_pending_plan = {'task': tool, 'params': params, 'files': list(self.agent_selected_files)}
         lines = []
+        understanding = (partial.get('intent') or {}).get('understanding', '')
+        if understanding:
+            lines.append(f"需求理解：{understanding}")
         for m in partial.get('file_metadata') or []:
             lines.append(f"文件: {m.get('basename')} | {m.get('type')} | 行{m.get('rows')} 列{m.get('columns')}")
         lines.append(f"任务: {tool}（{TOOL_REGISTRY.get(tool, {}).get('description', '')}）")
@@ -2570,8 +3420,12 @@ class ExcelProcessorApp:
                     'output_files': final.get('output_files'),
                     'error': final.get('error'),
                     'status': final.get('status'),
+                    'verification': final.get('verification'),
+                    'repair_rounds': final.get('repair_rounds'),
                     'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
+                # Loop④：展示结果摘要与自检结论，等待用户满意/反馈
+                self._show_feedback(final)
             except Exception as e:
                 self.agent_log(f"✗ 执行失败: {str(e)}")
                 error = str(e)
@@ -2592,6 +3446,7 @@ class ExcelProcessorApp:
     def agent_cancel_plan(self):
         """Agent：取消待执行方案"""
         self.agent_pending_plan = None
+        self._hide_interaction()
         self._agent_set_plan("已取消", False)
         self.agent_log("已取消执行方案")
 
@@ -2615,20 +3470,42 @@ class ExcelProcessorApp:
         result = response.json()
         return str(result.get('answer', '') or '')
 
-    def call_code_generator_api(self, api_url, api_key, user_request, file_metadata, sample_rows, constraints):
+    def call_reflection_api(self, api_url, api_key, user_request, input_meta, output_meta, output_summary):
+        """调用反思质检（复用 /chat-messages 通道，不新增 Dify 应用），返回 {satisfied, reason, suggestions}"""
+        prompt = REFLECTION_PROMPT_TEMPLATE.format(
+            request=user_request,
+            input_meta=input_meta,
+            output_meta=output_meta,
+            output_summary=output_summary,
+        )
+        answer = self.call_intent_api(api_url, api_key, prompt)
+        parsed = _parse_json_loose(answer)
+        if not isinstance(parsed, dict):
+            return {'satisfied': True, 'reason': f'反思返回无法解析（原文: {answer[:120]}）', 'suggestions': ''}
+        return {
+            'satisfied': bool(parsed.get('satisfied', True)),
+            'reason': str(parsed.get('reason') or ''),
+            'suggestions': str(parsed.get('suggestions') or ''),
+        }
+
+    def call_code_generator_api(self, api_url, api_key, user_request, file_metadata, sample_rows, constraints,
+                                previous_code=''):
         """调用 Dify 代码生成 workflow（/workflows/run blocking），解析 data.outputs.result JSON"""
         url = f"{api_url}/workflows/run"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
+        inputs = {
+            "user_request": user_request,
+            "file_metadata": file_metadata,
+            "sample_rows": sample_rows,
+            "execution_constraints": constraints,
+        }
+        if previous_code:
+            inputs['previous_code'] = previous_code  # 修复循环：携带上一轮代码供参考修改
         payload = {
-            "inputs": {
-                "user_request": user_request,
-                "file_metadata": file_metadata,
-                "sample_rows": sample_rows,
-                "execution_constraints": constraints,
-            },
+            "inputs": inputs,
             "response_mode": "blocking",
             "user": "excel-agent-codegen"
         }
@@ -2664,11 +3541,24 @@ class ExcelProcessorApp:
                 return normalized
         return outputs
 
-    def parse_intent_response(self, text):
-        """解析意图识别返回文本为 (task, params)；宽松 JSON + 白名单校验，custom 任务单独处理"""
+    def parse_intent_meta(self, text):
+        """解析意图识别返回文本为完整 dict（task/params/understanding/clarify_questions 等）"""
         if not text:
             raise ValueError("意图识别返回为空")
         parsed = _parse_json_loose(text)
+        truncated = False
+        if parsed is None:
+            # 截断场景：先尝试提取平衡子串（如 {...} 前半部分完整 JSON）
+            sub = _extract_json_substring((text or '').strip())
+            if sub:
+                parsed = _parse_json_loose(sub)
+                truncated = True
+            else:
+                # 无平衡子串（对象未闭合被截断）：用正则尽力提取 task 字段
+                m = re.search(r'"task"\s*:\s*"([^"]+)"', text or '')
+                if m:
+                    parsed = {'task': m.group(1), 'params': {}}
+                    truncated = True
         if parsed is None:
             preview = text.strip()[:200]
             if '{{#' in preview:
@@ -2684,11 +3574,48 @@ class ExcelProcessorApp:
             params = {}
         elif not isinstance(params, dict):
             raise ValueError("params 必须为JSON对象")
+        understanding = str(parsed.get('understanding') or '').strip()
+        questions = parsed.get('clarify_questions')
+        if not isinstance(questions, list):
+            questions = []
+        questions = [str(q).strip() for q in questions if str(q).strip()]
+        # 截断检测：can_use_builtin_tool 非 bool（如截断成 'f'/'tru'）或原文未以 '}' 结尾
+        cb_raw = parsed.get('can_use_builtin_tool')
+        if cb_raw is not None and not isinstance(cb_raw, bool):
+            truncated = True
+            cb_raw = None
+        raw_stripped = (text or '').strip()
+        if not truncated and raw_stripped and not raw_stripped.endswith('}'):
+            # 尾部非 '}'：可能是截断（半截 JSON），也可能是带说明文字（如 "...} 完毕"）。
+            # 仅当尾部为 ASCII 字母/引号/冒号/逗号时视为截断特征
+            tail = raw_stripped[-1]
+            if tail in ('"', ':', ',') or (tail.isascii() and tail.isalpha()):
+                truncated = True
+        if cb_raw is None:
+            can_builtin = (task != 'custom')
+        else:
+            can_builtin = bool(cb_raw)
+        confidence = parsed.get('confidence')
+        meta = {
+            'task': task,
+            'params': params,
+            'understanding': understanding,
+            'clarify_questions': questions,
+            'can_use_builtin_tool': can_builtin,
+            'confidence': float(confidence) if isinstance(confidence, (int, float)) else None,
+            'truncated': truncated,
+        }
         if task == 'custom':
-            return 'custom', params
+            meta['reason'] = str(params.get('reason') or parsed.get('reason') or '')
+            return meta
         if task not in TOOL_REGISTRY:
             raise ValueError(f"未知/不支持的任务: {task}（支持: {','.join(sorted(TOOL_REGISTRY.keys()))}）")
-        return task, params
+        return meta
+
+    def parse_intent_response(self, text):
+        """解析意图识别返回文本为 (task, params)；宽松 JSON + 白名单校验，custom 任务单独处理（兼容旧调用）"""
+        meta = self.parse_intent_meta(text)
+        return meta['task'], meta['params']
 
     def execute_agent_task(self, task, params, files, out_dir=None):
         """Agent 任务分发（白名单，Phase 2 迁入 Tool Registry）"""

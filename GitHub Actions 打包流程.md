@@ -17,6 +17,7 @@
 ├── excel_processor.spec         ← PyInstaller 配置（Windows/Linux 用）
 ├── excel_processor_macos.spec   ← PyInstaller 配置（macOS .app 用）
 ├── requirements.txt             ← Python 依赖
+├── dify_dsl/                    ← Dify 应用 DSL（File Agent Intent / Code Generator，供部署 Dify 用）
 ├── build_all.sh                 ← 一键打包主入口
 ├── build_macos.sh               ← macOS 打包脚本
 ├── build_linux.sh               ← Linux/信创打包脚本
