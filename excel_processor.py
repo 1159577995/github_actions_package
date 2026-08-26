@@ -1289,30 +1289,70 @@ if getattr(sys, 'frozen', False):
         BASE_DIR = exe_dir
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-AGENT_WORKSPACE_ROOT = os.path.join(BASE_DIR, 'agent_workspace')
+
+APP_NAME = "Excel处理器-Dify答案匹配工具"
+
+
+def _is_app_translocated(path):
+    """macOS 通过 App Translocation 运行时，应用会落到只读的临时挂载目录。"""
+    norm = os.path.abspath(path)
+    return sys.platform == 'darwin' and '/AppTranslocation/' in norm
+
+
+def _is_writable_dir(path):
+    """检测目录是否可写；不存在时尝试创建并写一个临时探针文件。"""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, '.write_probe')
+        with open(probe, 'a', encoding='utf-8'):
+            pass
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _default_user_data_dir():
+    """跨平台用户数据目录：当产物同级目录不可写时，回退到这里。"""
+    home = os.path.expanduser('~')
+    if sys.platform == 'darwin':
+        return os.path.join(home, 'Library', 'Application Support', APP_NAME)
+    if os.name == 'nt':
+        return os.path.join(os.environ.get('APPDATA', home), APP_NAME)
+    return os.path.join(home, f'.{APP_NAME}')
+
+
+_STORAGE_DIR_CACHE = [None]
+
+
+def _resolve_storage_dir():
+    """解析可写的应用存储目录；优先产物同级，不可写或被 App Translocation 时回退。"""
+    if _STORAGE_DIR_CACHE[0] is None:
+        candidates = []
+        if not _is_app_translocated(BASE_DIR):
+            candidates.append(BASE_DIR)
+        candidates.append(_default_user_data_dir())
+        candidates.append(os.path.expanduser('~'))
+        for d in candidates:
+            if _is_writable_dir(d):
+                _STORAGE_DIR_CACHE[0] = d
+                break
+        if _STORAGE_DIR_CACHE[0] is None:
+            _STORAGE_DIR_CACHE[0] = os.path.expanduser('~')
+    return _STORAGE_DIR_CACHE[0]
+
+
+def _resolve_agent_workspace_root():
+    """Agent 沙箱工作区根目录。"""
+    return os.path.join(_resolve_storage_dir(), 'agent_workspace')
 
 # 运行日志落盘（exe 同目录；源码运行时在项目目录）。任何异常静默忽略，不影响主流程。
 _LOG_LOCK = threading.Lock()
-_LOG_DIR_CACHE = [None]  # 日志目录缓存：优先可执行文件同级，不可写则回退用户主目录
 
 
 def _resolve_log_dir():
-    """确定可用的日志目录：BASE_DIR（可执行文件同级）不可写时回退到用户主目录"""
-    if _LOG_DIR_CACHE[0] is None:
-        for d in (BASE_DIR, os.path.expanduser('~')):
-            try:
-                os.makedirs(d, exist_ok=True)
-                test = os.path.join(d, '.log_write_test')
-                with open(test, 'a', encoding='utf-8'):
-                    pass
-                os.remove(test)
-                _LOG_DIR_CACHE[0] = d
-                break
-            except Exception:
-                continue
-        if _LOG_DIR_CACHE[0] is None:
-            _LOG_DIR_CACHE[0] = os.path.expanduser('~')
-    return _LOG_DIR_CACHE[0]
+    """确定可用的日志目录：优先产物同级，不可写或被转移运行时回退到用户数据目录。"""
+    return _resolve_storage_dir()
 
 
 def _runtime_log(msg):
@@ -1328,7 +1368,7 @@ def _runtime_log(msg):
 
 def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
     """受限执行生成代码：隔离工作区 + 环境白名单 + 超时；返回 (ok, log, output_files)"""
-    ws_dir = os.path.join(AGENT_WORKSPACE_ROOT, task_id)
+    ws_dir = os.path.join(_resolve_agent_workspace_root(), task_id)
     in_dir = os.path.join(ws_dir, 'input')
     out_ws = os.path.join(ws_dir, 'output')
     tmp_dir = os.path.join(ws_dir, 'temp')
@@ -1382,6 +1422,21 @@ def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
         return False, f"执行异常: {str(e)}", []
 
 
+def open_directory_in_explorer(path):
+    """跨平台打开文件所在目录；path 可为文件或目录。"""
+    target = os.path.abspath(path)
+    directory = target if os.path.isdir(target) else os.path.dirname(target)
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"目录不存在: {directory}")
+    if os.name == 'nt':
+        os.startfile(directory)
+        return
+    if sys.platform == 'darwin':
+        subprocess.run(['open', directory], check=True)
+        return
+    subprocess.run(['xdg-open', directory], check=True)
+
+
 class ExcelProcessorApp:
     def __init__(self, root):
         self.root = root
@@ -1410,6 +1465,8 @@ class ExcelProcessorApp:
         # 保存调试数据的变量
         self.current_question = ""
         self.current_api_response = ""
+        self.latest_output_path = None
+        self.log_file_path = os.path.join(_resolve_log_dir(), '运行日志.log')
 
         # 各 API Key 输入框的查看保护状态：widget -> {"clicks":int, "last":float, "unlocked":bool, "after_id":str|None}
         self._apikey_state = {}
@@ -1493,8 +1550,12 @@ class ExcelProcessorApp:
         # 状态栏（先创建，固定在底部）
         self.status_var = tk.StringVar()
         self.status_var.set("就绪")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        status_frame = ttk.Frame(self.root, relief=tk.SUNKEN)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        status_bar = ttk.Label(status_frame, textvariable=self.status_var, anchor=tk.W)
+        status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        ttk.Button(status_frame, text="打开最近输出目录", command=self.open_latest_output_dir).pack(side=tk.RIGHT, padx=4, pady=2)
+        ttk.Button(status_frame, text="打开日志目录", command=self.open_log_dir).pack(side=tk.RIGHT, padx=4, pady=2)
 
         # 主容器：Notebook 双TAB（两种模式）
         self.notebook = ttk.Notebook(self.root)
@@ -1522,6 +1583,30 @@ class ExcelProcessorApp:
         # 统一绑定鼠标滚轮（指向当前激活TAB的Canvas，避免bind_all互相覆盖）
         self._active_canvas = self.reverse_canvas
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _remember_output_file(self, path):
+        """记录当前会话最近一次修改或生成的输出文件。"""
+        if path:
+            self.latest_output_path = os.path.abspath(path)
+
+    def _show_open_dir_error(self, title, err):
+        messagebox.showerror(title, f"打开目录失败：{str(err)}")
+
+    def open_latest_output_dir(self):
+        """打开最近一次输出文件所在目录；若当前尚无输出，则退回日志目录。"""
+        target = self.latest_output_path or self.log_file_path
+        try:
+            open_directory_in_explorer(target)
+        except Exception as e:
+            self._show_open_dir_error("打开最近输出目录失败", e)
+
+    def open_log_dir(self):
+        """打开运行日志所在目录。"""
+        try:
+            self.log_file_path = os.path.join(_resolve_log_dir(), '运行日志.log')
+            open_directory_in_explorer(self.log_file_path)
+        except Exception as e:
+            self._show_open_dir_error("打开日志目录失败", e)
 
     def _setup_apikey_entry(self, entry):
         """为 API Key 输入框统一配置：默认值掩码保护、用户自填值明文；连点5次+密码查看默认值"""
@@ -2183,7 +2268,7 @@ class ExcelProcessorApp:
         """执行日志落盘：追加 JSONL 行到 agent_workspace/<task_id>/execution.log"""
         if not task_id:
             return
-        ws_dir = os.path.join(AGENT_WORKSPACE_ROOT, task_id)
+        ws_dir = os.path.join(_resolve_agent_workspace_root(), task_id)
         try:
             os.makedirs(ws_dir, exist_ok=True)
             entry = {
@@ -2394,6 +2479,7 @@ class ExcelProcessorApp:
                 for lg in final.get('logs') or []:
                     self.agent_log(lg)
                 for o in final.get('output_files') or []:
+                    self._remember_output_file(o)
                     self.agent_log(f"✓ 输出: {o}")
                 self.agent_log(f"状态: {final.get('status', 'done')}")
                 self.agent_log("✓ 全部执行完成")
@@ -2554,6 +2640,7 @@ class ExcelProcessorApp:
             txt_path = os.path.join(out_dir, f"{base}_agent_statistics_{timestamp}.txt")
             with open(txt_path, 'w', encoding='utf-8') as fh:
                 fh.write(report)
+            self._remember_output_file(txt_path)
             self.agent_log(f"✓ 统计报告已保存: {txt_path}")
             wb.close()
 
@@ -2565,6 +2652,7 @@ class ExcelProcessorApp:
             wb, ws = self._load_ws(f)
             base = os.path.splitext(os.path.basename(f))[0]
             path, cnt = export_failed_rows(ws, out_dir, base, scope=scope, fmt=fmt)
+            self._remember_output_file(path)
             self.agent_log(f"✓ 导出失败项 {cnt} 条: {path}")
             wb.close()
 
@@ -2575,6 +2663,7 @@ class ExcelProcessorApp:
             wb, ws = self._load_ws(f)
             base = os.path.splitext(os.path.basename(f))[0]
             path, ok_cnt, fail_cnt = self.retry_failed_rows(ws, mode, out_dir, base)
+            self._remember_output_file(path)
             self.agent_log(f"✓ 重试完成: 成功 {ok_cnt} / 失败 {fail_cnt} -> {path}")
             wb.close()
 
@@ -2591,6 +2680,7 @@ class ExcelProcessorApp:
         name_a = os.path.splitext(os.path.basename(files[src_idx]))[0]
         name_b = os.path.splitext(os.path.basename(files[tgt_idx]))[0]
         path, report = diff_worksheets(ws_a, ws_b, out_dir, name_a, name_b)
+        self._remember_output_file(path)
         self.agent_log('\n' + report)
         self.agent_log(f"✓ 差异报告已保存: {path}")
         wb_a.close()
@@ -2604,6 +2694,7 @@ class ExcelProcessorApp:
             wb, ws = self._load_ws(f)
             base = os.path.splitext(os.path.basename(f))[0]
             path, cnt = export_columns_csv(ws, out_dir, base, columns=columns, keyword=keyword)
+            self._remember_output_file(path)
             self.agent_log(f"✓ 已导出 {cnt} 行: {path}")
             wb.close()
 
@@ -3056,6 +3147,7 @@ class ExcelProcessorApp:
             saved_file_path = file_path
             try:
                 wb.save(file_path)
+                self._remember_output_file(file_path)
                 self.forward_log(f"✓ 文件已保存: {file_path}")
             except PermissionError:
                 base_name = os.path.splitext(file_path)[0]
@@ -3065,6 +3157,7 @@ class ExcelProcessorApp:
                 self.forward_log(f"⚠ 原文件被占用，保存到新文件: {new_file_path}")
                 wb.save(new_file_path)
                 saved_file_path = new_file_path
+                self._remember_output_file(new_file_path)
                 self.forward_log(f"✓ 文件已保存: {new_file_path}")
                 messagebox.showwarning("保存提示", f"原文件被占用，已保存到新文件:\n{new_file_path}")
             except Exception as e:
@@ -3112,6 +3205,7 @@ class ExcelProcessorApp:
                     outputs_str = json.dumps(outputs, ensure_ascii=False) if outputs else ''
                     error = str(record.get('error', '') or '')
                     writer.writerow([row_idx, message_id, question, systemfrom, outputs_str[:3000], error])
+                self._remember_output_file(csv_path)
             self.forward_log(f"✓ 正向失败记录已保存: {csv_path} ({len(failed_records)}条)")
         except Exception as e:
             self.forward_log(f"✗ 导出正向失败记录时出错: {str(e)}")
@@ -3643,6 +3737,7 @@ class ExcelProcessorApp:
             saved_file_path = file_path
             try:
                 wb.save(file_path)
+                self._remember_output_file(file_path)
                 self.log(f"✓ 文件已保存: {file_path}")
             except PermissionError:
                 base_name = os.path.splitext(file_path)[0]
@@ -3652,6 +3747,7 @@ class ExcelProcessorApp:
                 self.log(f"⚠ 原文件被占用，保存到新文件: {new_file_path}")
                 wb.save(new_file_path)
                 saved_file_path = new_file_path
+                self._remember_output_file(new_file_path)
                 self.log(f"✓ 文件已保存: {new_file_path}")
                 messagebox.showwarning("保存提示", f"原文件被占用，已保存到新文件:\n{new_file_path}")
             except Exception as e:
@@ -4108,6 +4204,7 @@ class ExcelProcessorApp:
                         hit_type, match_type, arr_count, arr_detail, keyword_info,
                         sim_request, sim_response, error
                     ])
+                self._remember_output_file(csv_path)
             
             self.log(f"✓ 失败记录已保存: {csv_path} ({len(failed_records)}条)")
         except Exception as e:
@@ -4347,7 +4444,7 @@ def main():
     except Exception:
         _runtime_log("启动异常:\n" + traceback.format_exc())
         try:
-            err_path = os.path.join(BASE_DIR, '启动错误.log')
+            err_path = os.path.join(_resolve_log_dir(), '启动错误.log')
             with open(err_path, 'a', encoding='utf-8') as fh:
                 fh.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动异常:\n{traceback.format_exc()}\n")
         except Exception:

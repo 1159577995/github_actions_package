@@ -116,7 +116,7 @@ echo 使用方法：双击 dist 目录下的 Excel处理器-Dify答案匹配工�
 echo.
 echo 提示：
 echo - 首次启动较慢属正常现象（PyInstaller 单文件自解压）
-echo - 文件处理 Agent 的沙箱工作区将生成在产物同目录 agent_workspace\ 下
+echo - 文件处理 Agent 的沙箱工作区优先生成在产物同目录 agent_workspace\ 下；若同级目录不可写，则回退到 %%APPDATA%%\Excel处理器-Dify答案匹配工具\agent_workspace\
 echo - 如被杀毒软件误报，请添加信任（PyInstaller 单文件打包常见误报）
 echo ======================================
 
