@@ -20,6 +20,8 @@ import ast
 import uuid
 import shutil
 import subprocess
+import io
+import contextlib
 from datetime import datetime
 
 
@@ -1277,6 +1279,33 @@ def validate_generated_code(code):
     return len(issues) == 0, issues
 
 
+def _sandbox_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """限制动态代码可导入的模块范围。"""
+    root = name.split('.')[0]
+    if root in FORBIDDEN_IMPORTS:
+        raise ImportError(f"禁止导入: {name}")
+    allowed_roots = {
+        'os', 'json', 'csv', 're', 'math', 'statistics',
+        'pathlib', 'datetime', 'pandas', 'openpyxl',
+    }
+    if root not in allowed_roots:
+        raise ImportError(f"未允许的导入: {name}")
+    return __import__(name, globals, locals, fromlist, level)
+
+
+def _sandbox_builtins():
+    """动态代码可用的最小内建函数集合。"""
+    builtin_obj = __builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__
+    allowed = {
+        'abs', 'all', 'any', 'bool', 'dict', 'enumerate', 'filter', 'float',
+        'int', 'isinstance', 'len', 'list', 'max', 'min', 'print', 'range',
+        'round', 'set', 'sorted', 'str', 'sum', 'tuple', 'zip',
+    }
+    result = {name: builtin_obj[name] for name in allowed if name in builtin_obj}
+    result['__import__'] = _sandbox_import
+    return result
+
+
 # 沙箱工作区根目录：源码运行取项目目录；PyInstaller 打包后 __file__ 指向临时解压目录或
 # 包内资源目录（退出即删/只读），故 frozen 模式改用可执行文件所在目录，保证沙箱文件持久保留
 if getattr(sys, 'frozen', False):
@@ -1367,7 +1396,7 @@ def _runtime_log(msg):
 
 
 def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
-    """受限执行生成代码：隔离工作区 + 环境白名单 + 超时；返回 (ok, log, output_files)"""
+    """受限执行生成代码：隔离工作区 + 环境白名单；返回 (ok, log, output_files)"""
     ws_dir = os.path.join(_resolve_agent_workspace_root(), task_id)
     in_dir = os.path.join(ws_dir, 'input')
     out_ws = os.path.join(ws_dir, 'output')
@@ -1396,28 +1425,41 @@ def run_code_sandbox(code, input_files, out_dir, task_id, timeout=60):
         'LANG': 'en_US.UTF-8',
     }
     try:
-        proc = subprocess.run(
-            [sys.executable, script_path],
-            cwd=ws_dir,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-        log = proc.stdout.decode('utf-8', errors='replace')[-4000:]
-        if proc.returncode != 0:
-            return False, f"退出码 {proc.returncode}\n{log}", []
+        old_cwd = os.getcwd()
+        old_env = {k: os.environ.get(k) for k in env}
+        stdout_buffer = io.StringIO()
+        sandbox_globals = {
+            '__name__': '__sandbox__',
+            '__builtins__': _sandbox_builtins(),
+        }
+        compiled = compile(code, script_path, 'exec')
+        try:
+            os.chdir(ws_dir)
+            os.environ.update(env)
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stdout_buffer):
+                exec(compiled, sandbox_globals, sandbox_globals)
+                maybe_main = sandbox_globals.get('main')
+                if callable(maybe_main):
+                    maybe_main()
+        finally:
+            os.chdir(old_cwd)
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        log = stdout_buffer.getvalue()[-4000:]
         outputs = [os.path.join(out_ws, n) for n in os.listdir(out_ws)
                    if os.path.isfile(os.path.join(out_ws, n))]
+        if not outputs:
+            detail = log or "动态代码执行完成，但没有在 OUTPUT_DIR 中生成任何文件"
+            return False, detail, []
         final_outputs = []
         for o in outputs:
             dest = os.path.join(out_dir, os.path.basename(o))
             shutil.copy2(o, dest)
             final_outputs.append(dest)
         return True, log, final_outputs
-    except subprocess.TimeoutExpired:
-        return False, f"执行超时（{timeout}秒），已终止", []
     except Exception as e:
         return False, f"执行异常: {str(e)}", []
 
@@ -2566,12 +2608,9 @@ class ExcelProcessorApp:
                 f"LLM节点模型是否可用、End节点输出变量是否为 result、应用是否已发布。原始返回: "
                 f"{json.dumps(result, ensure_ascii=False)[:300]}")
         if isinstance(result_str, str):
-            try:
-                parsed = json.loads(result_str)
-                if isinstance(parsed, dict):
-                    return parsed
-            except (json.JSONDecodeError, ValueError):
-                pass
+            parsed = _parse_json_loose(result_str)
+            if isinstance(parsed, dict):
+                return parsed
         return outputs
 
     def parse_intent_response(self, text):
