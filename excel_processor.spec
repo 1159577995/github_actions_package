@@ -29,9 +29,9 @@ a = Analysis(
     datas=([(icon_path, '.')] if use_icon else []) + extra_datas,
     # Windows 单文件打包对延迟导入更敏感；这里显式收集 LangGraph/LangChain Core
     # 的子模块与包元数据，避免双击启动时在 Agent 图构建阶段导入失败。
-    hiddenimports=[
-        'openpyxl', 'requests',
-    ] + langgraph_hiddenimports + langchain_core_hiddenimports,
+      hiddenimports=[
+          'openpyxl', 'requests', 'pandas',
+      ] + langgraph_hiddenimports + langchain_core_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

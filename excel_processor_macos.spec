@@ -22,7 +22,7 @@ a = Analysis(
     # langgraph/langchain 在 excel_processor.py 的函数内延迟导入（build_agent_graph），
     # PyInstaller 静态分析无法发现，必须显式声明，否则打包后文件处理 Agent 功能崩溃
     hiddenimports=[
-        'openpyxl', 'requests',
+          'openpyxl', 'requests', 'pandas',
         'langgraph', 'langgraph.graph', 'langgraph.checkpoint.memory',
         'langchain_core',
     ],

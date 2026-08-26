@@ -1215,7 +1215,7 @@ EXECUTION_CONSTRAINTS = (
     "只能操作系统分配的工作目录；只能读取 INPUT_DIR 中的输入文件；只能写入 OUTPUT_DIR。"
     "禁止网络访问；禁止 subprocess/os.system/shell；禁止删除文件；禁止覆盖原文件；"
     "禁止读取环境变量中的密钥；禁止访问 HOME 目录；禁止 pip install；禁止 eval/exec；"
-    "必须使用确定性的文件处理逻辑；优先使用 pandas/openpyxl/csv/json/pathlib/re/datetime。"
+    "必须使用确定性的文件处理逻辑；优先使用 openpyxl/csv/json/pathlib/re/datetime，只有在明显更合适时才使用 pandas。"
 )
 
 # AST 校验黑名单（原则：禁危险库/操作，不禁合法文件处理所需的 os/shutil/pathlib 本身）
