@@ -2057,7 +2057,9 @@ class ExcelProcessorApp:
         self.agent_pending_plan = None
         self.agent_log_lock = threading.Lock()
         self.agent_thread_config = None
-        self.agent_graph = build_agent_graph(self)
+        # 懒加载 Agent 图：避免 GUI 启动阶段被 LangGraph 依赖链阻塞
+        self.agent_graph = None
+        self.agent_graph_error = None
 
         # 1. 文件选择区
         file_frame = ttk.LabelFrame(scrollable_frame, text="文件选择", padding=10)
@@ -2154,6 +2156,29 @@ class ExcelProcessorApp:
             self.agent_log_text.see(tk.END)
             self.root.update()
 
+    def _ensure_agent_graph(self):
+        """按需初始化 LangGraph，避免将其放在主窗口启动路径上。"""
+        if self.agent_graph is not None:
+            return True
+        try:
+            self.agent_log("正在初始化文件处理 Agent 引擎...")
+            self.agent_graph = build_agent_graph(self)
+            self.agent_graph_error = None
+            self.agent_log("文件处理 Agent 引擎初始化完成")
+            return True
+        except Exception as e:
+            self.agent_graph = None
+            self.agent_graph_error = str(e)
+            _runtime_log(f"Agent 图初始化失败: {str(e)}")
+            self.agent_log(f"✗ 文件处理 Agent 引擎初始化失败: {str(e)}")
+            messagebox.showerror(
+                "Agent 初始化失败",
+                "文件处理 Agent 初始化失败，主界面仍可继续使用。\n\n"
+                f"详情：{str(e)}\n\n"
+                "请查看 运行日志.log 或重新打包后重试。"
+            )
+            return False
+
     def _agent_write_log(self, task_id, section, data):
         """执行日志落盘：追加 JSONL 行到 agent_workspace/<task_id>/execution.log"""
         if not task_id:
@@ -2242,6 +2267,8 @@ class ExcelProcessorApp:
         request = self.agent_request_text.get('1.0', tk.END).strip()
         if not request:
             messagebox.showwarning("警告", "请描述你的需求！")
+            return
+        if not self._ensure_agent_graph():
             return
 
         self.agent_running = True
@@ -2343,6 +2370,8 @@ class ExcelProcessorApp:
         plan = self.agent_pending_plan
         if not plan:
             messagebox.showwarning("警告", "请先分析需求！")
+            return
+        if not self._ensure_agent_graph():
             return
         task_id = (self.agent_thread_config or {}).get('configurable', {}).get('thread_id', '')
         summary = self._agent_plan_summary(plan)
@@ -4325,7 +4354,7 @@ def main():
             pass
         try:
             if root is not None:
-                tk.messagebox.showerror("启动失败", f"程序启动时发生异常，详情见 运行日志.log：\n\n{traceback.format_exc()}")
+                messagebox.showerror("启动失败", f"程序启动时发生异常，详情见 运行日志.log：\n\n{traceback.format_exc()}")
         except Exception:
             pass
         raise
