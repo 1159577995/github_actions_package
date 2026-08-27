@@ -1,148 +1,216 @@
-# File Agent Code Generator —— Dify Workflow DSL
-# 用途：根据用户需求与文件结构，生成一次性的安全 Python 文件处理代码（不执行代码）
-# 调用方式：/workflows/run，响应 data.outputs.result 为 JSON 字符串（含 code 字段）
-# 导入方式：Dify 工作台 → 导入 DSL 文件 → 选择本文件
-# 注意：导入后请在 LLM 节点中把模型切换为你实例可用的模型（默认占位 openai/gpt-4o-mini）
 app:
   description: 根据用户需求与文件结构生成一次性的安全 Python 文件处理代码（不负责执行）
-  icon: 🛠️
-  icon_background: '#E0E0E0'
+  icon: 🤖
+  icon_background: '#FFEAD5'
   mode: workflow
-  name: File Agent Code Generator
-  kind: app
+  name: 文件处理代码生成
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: package
+  value:
+    plugin_unique_identifier: langgenius/tongyi:0.2.9@76eb0772e08503769a19a4161bffafb5a90c4d4e0fee17b98c57c374404deae3
+kind: app
+version: 0.3.0
 workflow:
-  id: 5c2d0e5f-3a4b-5c6d-9e7f-8a9b0c1d2e3f
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .JPG
+      - .JPEG
+      - .PNG
+      - .GIF
+      - .WEBP
+      - .SVG
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 20
+        file_size_limit: 40
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: true
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
   graph:
     edges:
-      - id: 3c4d5e6f-7a8b-9c0d-1e2f-3a4b5c6d7e8f
-        source: 11111111-1111-1111-1111-111111111111
-        sourceHandle: source
-        target: 22222222-2222-2222-2222-222222222222
-        targetHandle: target
-      - id: 4d5e6f7a-8b9c-0d1e-2f3a-4b5c6d7e8f9a
-        source: 22222222-2222-2222-2222-222222222222
-        sourceHandle: source
-        target: 33333333-3333-3333-3333-333333333333
-        targetHandle: target
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: start
+        targetType: llm
+      id: 1787306302656-source-1787306416505-target
+      source: '1787306302656'
+      sourceHandle: source
+      target: '1787306416505'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: llm
+        targetType: end
+      id: 1787306416505-source-1787306450121-target
+      source: '1787306416505'
+      sourceHandle: source
+      target: '1787306450121'
+      targetHandle: target
+      type: custom
+      zIndex: 0
     nodes:
-      - data:
-          type: start
-          title: 开始
-          variables:
-            - variable: user_request
-              label: 用户需求
-              required: true
-              max_length: 20000
-              type: text-input
-            - variable: file_metadata
-              label: 文件结构
-              required: true
-              max_length: 20000
-              type: text-input
-            - variable: sample_rows
-              label: 文件样例
-              required: false
-              max_length: 20000
-              type: text-input
-            - variable: execution_constraints
-              label: 执行约束
-              required: true
-              max_length: 5000
-              type: text-input
-        id: 11111111-1111-1111-1111-111111111111
-        position:
-          x: 0
-          y: 0
-      - data:
-          type: llm
-          title: 代码生成
-          version: '1'
-          model:
-            provider: openai
-            name: gpt-4o-mini
-            mode: chat
-            completion_params:
-              temperature: 0.1
-              max_tokens: 4096
-          prompt_template:
-            - id: 55555555-5555-5555-5555-555555555555
-              role: system
-              text: |-
-                你是一个安全的 Python 文件处理代码生成器。你的任务是根据用户需求和文件结构生成一次性的 Python 文件处理程序。你只负责生成代码，不负责执行代码。
+    - data:
+        desc: ''
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - label: 用户需求
+          max_length: 369999999
+          options: []
+          required: true
+          type: paragraph
+          variable: user_request
+        - label: 文件结构
+          max_length: 369999999
+          options: []
+          required: true
+          type: paragraph
+          variable: file_metadata
+        - label: 文件样例
+          max_length: 369999999
+          options: []
+          required: false
+          type: paragraph
+          variable: sample_rows
+        - label: 执行约束
+          max_length: 369999999
+          options: []
+          required: true
+          type: paragraph
+          variable: execution_constraints
+      height: 168
+      id: '1787306302656'
+      position:
+        x: 80
+        y: 282
+      positionAbsolute:
+        x: 80
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        model:
+          completion_params:
+            temperature: 0.2
+          mode: chat
+          name: qwen3.7-plus
+          provider: langgenius/tongyi/tongyi
+        prompt_template:
+        - id: 2379e6c2-a05f-4722-8ab8-91da03e9cc6b
+          role: system
+          text: |-
+            你是一个安全的 Python 文件处理代码生成器。你的任务是根据用户需求和文件结构生成一次性的 Python 文件处理程序。你只负责生成代码，不负责执行代码。
 
-                用户需求：{{#11111111-1111-1111-1111-111111111111.user_request#}}
+            用户需求：{{#1787306302656.user_request#}}
 
-                文件结构：{{#11111111-1111-1111-1111-111111111111.file_metadata#}}
+            文件结构：{{#1787306302656.file_metadata#}}
 
-                文件样例：{{#11111111-1111-1111-1111-111111111111.sample_rows#}}
+            文件样例：{{#1787306302656.sample_rows#}}
 
-                执行约束：{{#11111111-1111-1111-1111-111111111111.execution_constraints#}}
+            执行约束：{{#1787306302656.execution_constraints#}}
 
-                必须遵守：
-                - 输入文件目录在环境变量 INPUT_DIR，输出目录在环境变量 OUTPUT_DIR，临时目录在环境变量 TEMP_DIR
-                - 必须通过 os.environ 读取这些路径（如 output_dir = os.environ["OUTPUT_DIR"]），禁止硬编码 /input、/output 等路径
-                - 只能操作系统分配的工作目录
-                - 只能读取用户明确选择的输入文件
-                - 只能写入指定 output 目录
-                - 禁止网络访问、禁止 subprocess、禁止 os.system、禁止 shell、禁止删除文件、禁止覆盖原文件
-                - 禁止读取环境变量中的密钥、禁止访问用户 HOME 目录、禁止动态下载代码、禁止 pip install、禁止执行 eval 与 exec
-                - 必须使用确定性的 Python 文件处理逻辑
+            必须遵守：
+            - 输入文件目录在环境变量 INPUT_DIR，输出目录在环境变量 OUTPUT_DIR，临时目录在环境变量 TEMP_DIR
+            - 必须通过 os.environ 读取这些路径（如 output_dir = os.environ["OUTPUT_DIR"]），禁止硬编码 /input、/output 等路径
+            - 只能操作系统分配的工作目录；只能读取用户明确选择的输入文件；只能写入指定 output 目录
+            - 必须至少生成 1 个输出文件到 OUTPUT_DIR，禁止只打印统计结果而不落盘；脚本结束前必须 print 输出的文件名或路径
+            - 执行方式二选一：要么在顶层直接执行处理逻辑，要么把逻辑封装为入口函数并在文件末尾调用它
+            - 推荐入口函数名为 main 或 process_excel；沙箱会自动按 main → process_excel → process → run → execute → handle 顺序调用第一个存在的入口函数
+            - 禁止既在顶层执行完整逻辑又定义入口函数后调用（会重复处理）；若定义入口函数，顶层只允许定义语句与 if __name__ == '__main__': 入口名()
+            - 禁止网络访问、禁止 subprocess、禁止 os.system、禁止 shell、禁止删除文件、禁止覆盖原文件
+            - 禁止读取环境变量中的密钥、禁止访问用户 HOME 目录、禁止动态下载代码、禁止 pip install
+            - 禁止 eval、exec、compile 及任何形式的动态执行（exec/eval/compile/__import__）
+            - 必须使用确定性的 Python 文件处理逻辑；优先使用 openpyxl、csv、json、pathlib、re、datetime，只有在明显更合适时才使用 pandas
 
-                优先使用：pandas、openpyxl、csv、json、pathlib、re、datetime
-
-                输出必须是 JSON（只输出这一个 JSON 对象，不要输出其他任何内容）：
-                {"success": true, "description": "处理方案说明", "code": "完整Python代码", "input_files": [], "output_files": [], "dependencies": []}
-          variables:
-            - variable_selector:
-                - 11111111-1111-1111-1111-111111111111
-                - user_request
-              value_selector: null
-            - variable_selector:
-                - 11111111-1111-1111-1111-111111111111
-                - file_metadata
-              value_selector: null
-            - variable_selector:
-                - 11111111-1111-1111-1111-111111111111
-                - sample_rows
-              value_selector: null
-            - variable_selector:
-                - 11111111-1111-1111-1111-111111111111
-                - execution_constraints
-              value_selector: null
-          context:
-            enabled: false
-            variable_selector: null
-          vision:
-            enabled: false
-          memory:
-            enabled: false
-            window:
-              enabled: false
-              size: 10
-          answer: ''
-          selected: false
-          model_config: {}
-        id: 22222222-2222-2222-2222-222222222222
-        position:
-          x: 240
-          y: 0
-      - data:
-          type: end
-          title: 结束
-          version: '1'
-          outputs:
-            - value_selector:
-                - 22222222-2222-2222-2222-222222222222
-                - text
-              variable: result
-          selected: false
-        id: 33333333-3333-3333-3333-333333333333
-        position:
-          x: 480
-          y: 0
+            输出必须是 JSON（只输出这一个 JSON 对象，不要输出其他任何内容）：
+            {"success": true, "description": "处理方案说明", "code": "完整Python代码", "input_files": [], "output_files": [], "dependencies": []}
+        selected: true
+        title: LLM
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 90
+      id: '1787306416505'
+      position:
+        x: 384
+        y: 282
+      positionAbsolute:
+        x: 384
+        y: 282
+      selected: true
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - '1787306416505'
+          - text
+          value_type: string
+          variable: result
+        selected: false
+        title: 结束
+        type: end
+      height: 90
+      id: '1787306450121'
+      position:
+        x: 688
+        y: 282
+      positionAbsolute:
+        x: 688
+        y: 282
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
     viewport:
-      x: 0
-      y: 0
-      zoom: 1
-  version: 0.1.5
-version: 0.1.5
+      x: 359.46114387113425
+      y: 179.86433196327215
+      zoom: 0.5960707742219857

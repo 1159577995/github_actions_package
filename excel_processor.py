@@ -5,7 +5,7 @@ Excel表格处理工具 - 调用Dify API匹配答案并填充渠道信息
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import openpyxl
 from openpyxl import load_workbook
 import requests
@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import io
 import contextlib
+import tempfile
 from datetime import datetime
 
 
@@ -189,7 +190,8 @@ INTENT_PROMPT_TEMPLATE = """你是一个Excel文件处理需求识别器。以�
   "task": "任务名",
   "params": {{}},
   "confidence": 0到1的置信度,
-  "understanding": "用1-2句话复述你对用户需求的理解（供用户确认）",
+  "understanding": "用1-2句通俗口语（像客服聊天一样、有温度）以第一人称复述你打算为用户做什么，例如'我来帮您把O列里出现的『(反向)』这几个字去掉，改完保存成一个新文件'；不要用'用户希望…'这类书面语，不要出现文件序号[0]这类内部术语（供理解确认展示）",
+  "friendly_summary": "用3-5句客服式口语整体说明你将如何处理：涉及哪个文件、具体做什么操作、结果保存在哪里。像微信聊天一样自然、有温度、通俗易懂，不要出现参数JSON、不要用'用户希望…'书面语（供执行方案预览展示）",
   "clarify_questions": ["需求中含糊或缺失的关键信息问题；明确则为空数组"],
   "can_use_builtin_tool": true或false
 }}
@@ -206,11 +208,20 @@ INTENT_PROMPT_TEMPLATE = """你是一个Excel文件处理需求识别器。以�
    inspect_excel / read_excel(limit) / read_text / search_text(keyword) /
    replace_text(find,replace) / copy_file / validate_output
    例如：{{"task":"filter_excel","params":{{"column":"P","operator":"equals","value":"失败"}}}}
+
+工具适用范围：
+- read_text / search_text / replace_text 仅适用于 txt/csv 等文本文件；
+- Excel（xlsx/xls）文件的查找替换、读取请使用 modify_excel / read_excel / filter_excel 等 Excel 工具，不要选用文本工具。
+- modify_excel 参数模板：{{"task":"modify_excel","params":{{"ops":[{{"type":"replace","column":"O","find":"(反向)","replace":""}}],"save_mode":"new|overwrite"}}}}
+  （用于 Excel 单元格内容查找替换/删除行等；Excel 文件请优先用它而非 replace_text）
+  save_mode：当用户要求"保存回原文件/覆盖原文件/直接修改原文件/保留在该文件"时填 "overwrite"（覆盖不可逆）；未明确要求改原文件时省略或填 "new"（另存新文件）。
+
 如果需求无法用上述任务完成，输出：{{"task":"custom","params":{{}},"reason":"简要说明","can_use_builtin_tool":false}}
 
 澄清规则：
 - 当需求存在歧义、缺少关键参数（统计口径/列名/范围/输出格式等）、或引用了文件列结构中不存在的列时，必须在 clarify_questions 中逐条列出需要用户补充的问题。
 - 当需求明确无歧义时，clarify_questions 必须为空数组 []。
+- 提取 find/equals 等查找关键字时，若文件列结构或数据样本中的实际写法与用户描述存在符号差异（如全角/半角括号、中英文标点），优先采用文件中实际出现的符号形式；无法确定时放入 clarify_questions 请用户确认写法。
 
 注意：绝对不要输出本地文件的绝对路径，文件引用一律使用序号索引（file_index）。"""
 
@@ -240,7 +251,16 @@ REFLECTION_PROMPT_TEMPLATE = """你是文件处理结果质检员。以下是：
 4. 输出摘要：
 {output_summary}
 
-请判断输出结果是否真正满足用户需求。只输出JSON对象（不要输出任何其他内容）：
+5. 输入内容样本（前3行）：
+{input_samples}
+
+6. 输出内容样本（前3行）：
+{output_samples}
+
+请判断输出结果是否真正满足用户需求。注意：
+- 结合内容样本对比输入与输出：若需求要求修改单元格内容（如去除某字样），但输出内容与输入完全一致，视为未满足；
+- 若内容已按要求变化（即使文件结构/行列数不变），视为满足。
+只输出JSON对象（不要输出任何其他内容）：
 {{
   "satisfied": true或false,
   "reason": "判断依据（简短）",
@@ -281,7 +301,7 @@ def scan_worksheet(ws):
             continue  # 空行跳过
         stats['total'] += 1
 
-        is_fail = (p_val == '失败')
+        is_fail = p_val.startswith('失败')
 
         # 匹配方式
         if s_val == '关键字匹配成功':
@@ -367,7 +387,7 @@ def export_failed_rows(ws, out_dir, source_name, scope='all', fmt='excel'):
     failed = []
     for row in ws.iter_rows(min_row=2):
         p_val = _cell_str(row, COL_FAIL)
-        if p_val != '失败':
+        if not p_val.startswith('失败'):
             continue
         s_val = _cell_str(row, COL_MATCH_TYPE)
         is_forward_fail = s_val.startswith('正向失败')
@@ -750,10 +770,88 @@ def split_excel(files, params, out_dir):
     return [dest], f"拆分为 {chunk} 个Sheet（每{rows_per}行）-> {os.path.basename(dest)}"
 
 
+# ---- 符号差异检测（find 匹配预检：全角/半角、中英文括号等） ----
+
+_BRACKET_PAIRS = [
+    ('（', '）'), ('(', ')'), ('【', '】'), ('[', ']'),
+    ('「', '」'), ('『', '』'), ('《', '》'), ('<', '>'),
+]
+
+_PUNCT_MAP = {  # 全角 → 半角
+    '（': '(', '）': ')', '【': '[', '】': ']',
+    '《': '<', '》': '>', '，': ',', '。': '.', '、': ',',
+    '：': ':', '；': ';', '！': '!', '？': '?',
+    '“': '"', '”': '"', '‘': "'", '’': "'", '　': ' ',
+}
+
+
+def _symbol_variants(text, max_variants=16):
+    """生成符号归一化变体（括号对互换、全角↔半角标点），不含原值、去重
+
+    示例：'【反向】' → '(反向)'、'[反向]'、'（反向）' 等；
+    最多生成 max_variants 个变体，防止组合爆炸。
+    """
+    if not text:
+        return []
+    variants = set()
+    # 1) 成对括号整体互换：'【X】' → '(X)' / '[X]' / '（X）' ...
+    for open_, close in _BRACKET_PAIRS:
+        if open_ not in text and close not in text:
+            continue
+        for t_open, t_close in _BRACKET_PAIRS:
+            if t_open == open_ and t_close == close:
+                continue
+            v = text.replace(open_, t_open).replace(close, t_close)
+            if v != text:
+                variants.add(v)
+    # 2) 全角↔半角 单字符标点互换
+    for c, t in _PUNCT_MAP.items():
+        if c in text:
+            variants.add(text.replace(c, t))
+    for t, c in _PUNCT_MAP.items():
+        if t in text:
+            variants.add(text.replace(t, c))
+    variants.discard(text)
+    return sorted(variants)[:max_variants]
+
+
+def check_find_in_column(path, column, find):
+    """检查 find 在指定列是否存在；不存在时探测符号变体并统计次数。
+
+    返回 {'found': bool, 'count': int, 'variants': [{'find': v, 'count': n}, ...]}
+    variants 按出现次数降序排列（次数最多的候选优先）。
+    """
+    wb = load_workbook(path, read_only=True)
+    ws = wb.active
+    col = _resolve_column(ws, column)
+    variants = _symbol_variants(find)
+    counts = {find: 0}
+    for v in variants:
+        counts[v] = 0
+    for row in ws.iter_rows(min_row=2):  # read_only 逐行，仅扫目标列
+        cell = row[col - 1]
+        if cell.value is None:
+            continue
+        s = str(cell.value)
+        for k in list(counts):
+            if k in s:
+                counts[k] += 1
+    wb.close()
+    if counts[find] > 0:
+        return {'found': True, 'count': counts[find], 'variants': []}
+    hits = [{'find': v, 'count': counts[v]} for v in variants if counts[v] > 0]
+    hits.sort(key=lambda x: x['count'], reverse=True)
+    return {'found': False, 'count': 0, 'variants': hits}
+
+
 def modify_excel(files, params, out_dir):
-    """通用修改（ops: [{type:replace,column,find,replace}, {type:delete_rows,column,equals}]）"""
+    """通用修改（ops: [{type:replace,column,find,replace}, {type:delete_rows,column,equals}]）
+
+    params.save_mode: 'new'（默认，另存新文件）| 'overwrite'（直接覆盖原文件，不可逆）
+    """
     path = files[0]
     ops = params.get('ops') or []
+    save_mode = str(params.get('save_mode') or 'new').strip().lower()
     wb = load_workbook(path)
     ws = wb.active
     for op in ops:
@@ -774,6 +872,10 @@ def modify_excel(files, params, out_dir):
             for row in list(ws.iter_rows(min_row=2)):
                 if _cell_str(row, col) == eq:
                     ws.delete_rows(row[0].row)
+    if save_mode == 'overwrite':
+        wb.save(path)
+        wb.close()
+        return [path], f"修改完成 -> {os.path.basename(path)}（已覆盖原文件）"
     base = os.path.splitext(os.path.basename(path))[0]
     dest = _new_path(out_dir, base, 'modified', '.xlsx')
     wb.save(dest)
@@ -826,8 +928,11 @@ def search_text(files, params, out_dir):
 
 
 def replace_text(files, params, out_dir):
-    """文本替换 → 新文件"""
+    """文本替换 → 新文件（仅支持文本文件；Excel 请用 modify_excel，避免损坏二进制）"""
     path = files[0]
+    t = detect_file_type(path)
+    if t in ('xlsx', 'xls'):
+        raise ValueError("replace_text 仅支持文本文件（txt/csv），Excel 文件请使用 modify_excel")
     find = str(params.get('find', ''))
     repl = str(params.get('replace', ''))
     with open(path, encoding='utf-8', errors='replace') as fh:
@@ -999,17 +1104,18 @@ TOOL_REGISTRY = {
                      }, 'run': modify_excel},
     'export_excel': {'description': '导出为新Excel（不覆盖源）', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': export_excel},
     'read_text': {'description': '读取文本文件', 'risk_level': 'low', 'deterministic': True,
-                  'input_schema': {'limit': {'type': 'int', 'required': False, 'default': 50, 'desc': '读取行数'}}, 'run': read_text},
+                  'input_schema': {'limit': {'type': 'int', 'required': False, 'default': 50, 'desc': '读取行数'}},
+                  'supports': {'txt', 'csv'}, 'run': read_text},
     'search_text': {'description': '文本关键词搜索', 'risk_level': 'low', 'deterministic': True,
                     'input_schema': {
                         'keyword': {'type': 'str', 'required': True, 'desc': '搜索关键词'},
                         'limit': {'type': 'int', 'required': False, 'default': 20, 'desc': '返回样例行数'},
-                    }, 'run': search_text},
+                    }, 'supports': {'txt', 'csv'}, 'run': search_text},
     'replace_text': {'description': '文本替换为新文件', 'risk_level': 'low', 'deterministic': True,
                      'input_schema': {
                          'find': {'type': 'str', 'required': True, 'desc': '查找内容'},
                          'replace': {'type': 'str', 'required': False, 'default': '', 'desc': '替换为'},
-                     }, 'run': replace_text},
+                     }, 'supports': {'txt', 'csv'}, 'run': replace_text},
     'validate_output': {'description': '输出文件校验', 'risk_level': 'low', 'deterministic': True, 'input_schema': {}, 'run': validate_output},
 }
 
@@ -1032,7 +1138,7 @@ def validate_tool_params(tool, params):
 
 
 def collect_output_meta(output_files):
-    """本地读取输出文件结构（Sheet/行数/列头），不含绝对路径，供反思质检使用"""
+    """本地读取输出文件结构 + 无表头列数据示例（供反思质检对比），不含绝对路径"""
     metas = []
     for path in output_files or []:
         try:
@@ -1049,6 +1155,13 @@ def collect_output_meta(output_files):
                     m['headers'] = [str(h) if h is not None else '' for h in header]
                 except StopIteration:
                     m['headers'] = []
+                try:
+                    data_cols, empty_cols, data_samples = _detect_headerless_data_columns(ws, m['headers'])
+                    m['data_columns'] = data_cols
+                    m['empty_columns'] = empty_cols
+                    m['data_samples'] = data_samples
+                except Exception:
+                    pass
                 wb.close()
             elif t == 'csv':
                 with open(path, encoding='utf-8-sig', errors='replace') as fh:
@@ -1088,6 +1201,31 @@ def _column_structure_text(metas):
     if empty_cols:
         parts.append(f"空列: {', '.join(empty_cols)}")
     return '\n'.join(parts)
+
+
+def _sample_content(paths, limit=3):
+    """读取文件前 N 行全部列内容样本（用于反思内容对比），每列截断防超长"""
+    lines = []
+    for p in (paths or [])[:2]:
+        try:
+            t = detect_file_type(p)
+            if t in ('xlsx', 'xls'):
+                wb = load_workbook(p, read_only=True)
+                ws = wb.active
+                for i, row in enumerate(ws.iter_rows(min_row=1, max_row=limit + 1, values_only=True)):
+                    lines.append(f"[{os.path.basename(p)}] 行{i + 1}: " + ' | '.join(
+                        str(v)[:12] if v is not None else '' for v in row))
+                wb.close()
+            else:
+                with open(p, encoding='utf-8-sig', errors='replace') as fh:
+                    for i in range(limit + 1):
+                        line = fh.readline()
+                        if not line:
+                            break
+                        lines.append(f"[{os.path.basename(p)}] 行{i + 1}: " + line.strip()[:120])
+        except Exception as e:
+            lines.append(f"[{os.path.basename(p)}] 读取失败: {str(e)}")
+    return '\n'.join(lines)
 
 
 def _detect_headerless_data_columns(ws, headers):
@@ -1172,6 +1310,7 @@ class FileAgentState(TypedDict, total=False):
     repair_feedback: str        # 反思意见（供重新生成代码）
     final_feedback: str         # 用户最终反馈（修改意见，触发下一轮）
     finished: bool              # 用户是否确认满意
+    input_snapshot: str         # 覆盖原文件前的原始内容快照路径（供自检对比修改前后）
 
 
 def build_agent_graph(app):
@@ -1352,7 +1491,20 @@ def build_agent_graph(app):
         files = state['input_files']
         params = state['plan'].get('params') or {}
         out_dir = os.path.dirname(os.path.abspath(files[0]))
+        # 工具-文件类型校验：supports 声明的工具只允许匹配的文件类型
+        supports = TOOL_REGISTRY.get(tool, {}).get('supports')
+        if supports:
+            for f in files:
+                t = detect_file_type(f)
+                if t not in supports:
+                    hint = ('；Excel 文件的查找/替换/读取请使用 modify_excel 等 Excel 工具'
+                            if t in ('xlsx', 'xls') else '')
+                    msg = f"工具 {tool} 不支持文件类型 {t}（支持: {'/'.join(sorted(supports))}）{hint}"
+                    logs.append(msg)
+                    return {'execution_result': {'ok': False, 'error': msg}, 'error': msg,
+                            'logs': logs, 'status': 'failed'}
         outputs = []
+        snapshot_path = None
         try:
             if tool == 'retry':
                 mode = str(params.get('mode', 'reverse') or 'reverse')
@@ -1364,11 +1516,28 @@ def build_agent_graph(app):
                     outputs.append(path)
                     logs.append(f"重试({mode}): 成功{ok}/失败{fail} -> {os.path.basename(path)}")
             else:
+                # 覆盖原文件（save_mode=overwrite）前保存快照：修改后输入=输出同一路径，自检无法自比，
+                # 需用快照（修改前内容）与输出对比；快照放系统临时目录，由 OS 回收
+                if (tool == 'modify_excel'
+                        and str((params or {}).get('save_mode') or '').strip().lower() == 'overwrite'
+                        and files and os.path.exists(files[0])):
+                    fd, snapshot_path = tempfile.mkstemp(prefix='orig_snapshot_',
+                                                         suffix=os.path.splitext(files[0])[1])
+                    os.close(fd)
+                    shutil.copy2(files[0], snapshot_path)
                 outs, summary = TOOL_REGISTRY[tool]['run'](files, params, out_dir)
                 outputs.extend(outs)
                 logs.append(summary)
-            return {'execution_result': {'ok': True}, 'output_files': outputs, 'logs': logs}
+            result = {'execution_result': {'ok': True}, 'output_files': outputs, 'logs': logs}
+            if snapshot_path:
+                result['input_snapshot'] = snapshot_path
+            return result
         except Exception as e:
+            if snapshot_path and os.path.exists(snapshot_path):
+                try:
+                    os.remove(snapshot_path)
+                except Exception:
+                    pass
             logs.append(f"执行失败: {str(e)}")
             return {'execution_result': {'ok': False, 'error': str(e)}, 'error': str(e),
                     'logs': logs, 'status': 'failed'}
@@ -1522,6 +1691,10 @@ def build_agent_graph(app):
                 api_url = app.agent_api_url_entry.get().strip()
                 api_key = app.agent_api_key_entry.get().strip()
                 if api_url and api_key:
+                    # 覆盖原文件模式：用执行前快照（修改前内容）作为输入样本，与输出（修改后）对比
+                    snapshot = state.get('input_snapshot') or ''
+                    input_src = ([snapshot] if snapshot and os.path.exists(snapshot)
+                                 else (state.get('input_files') or []))
                     reflection = app.call_reflection_api(
                         api_url, api_key,
                         user_request=state.get('user_request', ''),
@@ -1529,6 +1702,8 @@ def build_agent_graph(app):
                                                for m in (state.get('file_metadata') or [])], ensure_ascii=False),
                         output_meta=json.dumps(collect_output_meta(outputs), ensure_ascii=False),
                         output_summary='\n'.join(os.path.basename(o) for o in outputs),
+                        input_samples=_sample_content(input_src),
+                        output_samples=_sample_content(outputs),
                     )
             except Exception as e:
                 logs.append(f"反思API调用失败（降级为仅结构化校验）: {str(e)}")
@@ -1695,7 +1870,9 @@ EXECUTION_CONSTRAINTS = (
     "只能操作系统分配的工作目录；只能读取 INPUT_DIR 中的输入文件；只能写入 OUTPUT_DIR。"
     "必须至少生成 1 个输出文件到 OUTPUT_DIR；禁止只打印统计结果而不落盘。"
     "脚本结束前必须 print 生成的输出文件名或输出路径，便于日志排查。"
-    "必须在顶层直接执行处理逻辑，或在文件末尾调用你定义的入口函数（如 process_excel()），不要只定义函数不调用；"
+    "执行方式（二选一）：要么在顶层直接执行处理逻辑，要么把处理逻辑封装为入口函数并在文件末尾调用它；"
+    "推荐入口函数名为 main 或 process_excel，沙箱会自动按 main → process_excel → process → run → execute → handle 的顺序调用第一个存在的入口函数。"
+    "禁止既在顶层执行完整逻辑、又定义入口函数后再调用（会重复处理）；如果定义了入口函数，顶层只允许定义语句与 'if __name__ == '__main__': 入口名()'。"
     "禁止网络访问；禁止 subprocess/os.system/shell；禁止删除文件；禁止覆盖原文件；"
     "禁止读取环境变量中的密钥；禁止访问 HOME 目录；禁止 pip install；"
     "禁止 eval/exec/compile 及任何形式的动态执行（exec/eval/compile/__import__）；"
@@ -1779,7 +1956,15 @@ def validate_generated_code(code):
                         hints.append(f"[提示] 输出路径疑似未使用OUTPUT_DIR（相对路径保存）: {p}")
         elif isinstance(node, ast.Attribute):
             if node.attr in FORBIDDEN_ATTRS:
-                hard_issues.append(f"禁止属性: {node.attr}")
+                # 精确化：仅拦截 os./shutil./Path 等危险对象上的属性调用，
+                # 避免误伤 str.replace / cell.value.replace / list.remove 等安全方法
+                obj_src = ast.unparse(node.value) if hasattr(ast, 'unparse') else ''
+                root = obj_src.split('.')[0]
+                dangerous_obj = (root in ('os', 'shutil')
+                                 or obj_src.startswith('Path(')
+                                 or obj_src in ('Path', 'pathlib.Path'))
+                if dangerous_obj or not obj_src:
+                    hard_issues.append(f"禁止属性: {obj_src}.{node.attr}")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             low = node.value.lower()
             for pat in SUSPICIOUS_PATTERNS:
@@ -2745,10 +2930,14 @@ class ExcelProcessorApp:
             pass
 
     def _on_mousewheel(self, event):
-        """鼠标滚轮滚动当前激活TAB的滚动区域"""
+        """鼠标滚轮滚动当前激活TAB的滚动区域（兼容 macOS delta=±1/±2 与 Windows delta=±120）"""
         canvas = self._active_canvas
-        if canvas is not None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        if canvas is None or not event.delta:
+            return
+        delta = event.delta
+        # macOS 滚轮 delta 为 ±1/±2（非 Windows 的 ±120），直接按单位滚动；Windows 换算为 1 单位
+        units = -delta if abs(delta) < 120 else int(-1 * (delta / 120))
+        canvas.yview_scroll(units, "units")
 
     def forward_log(self, message):
         """向正向问答TAB页的日志区写入日志"""
@@ -2872,17 +3061,20 @@ class ExcelProcessorApp:
         self.agent_cancel_btn = ttk.Button(action_frame, text="取消", command=self.agent_cancel_plan, state=tk.DISABLED)
         self.agent_cancel_btn.pack(side=tk.LEFT, padx=5)
 
-        # 4.5 交互区（澄清回答 / 理解确认 / 结果反馈，按需显隐）
+        # 4.5 交互区（澄清回答 / 理解确认 / 符号校正 / 结果反馈，按需显隐）
         interact_frame = ttk.LabelFrame(scrollable_frame, text="Agent 交互", padding=10)
         interact_frame.pack(fill=tk.X, padx=10, pady=5)
         # 澄清行
         self.agent_clarify_label = ttk.Label(interact_frame, text="", wraplength=680)
         self.agent_clarify_entry = ttk.Entry(interact_frame, width=80)
-        self.agent_clarify_submit_btn = ttk.Button(interact_frame, text="提交回答", command=self._submit_clarify)
+        self.agent_clarify_submit_btn = ttk.Button(interact_frame, text="好的，提交", command=self._submit_clarify)
         # 理解确认行
         self.agent_understand_label = ttk.Label(interact_frame, text="", wraplength=680)
-        self.agent_understand_ok_btn = ttk.Button(interact_frame, text="理解正确，继续", command=self._on_understand_ok)
-        self.agent_revise_btn = ttk.Button(interact_frame, text="修正需求", command=self._on_revise)
+        self.agent_understand_ok_btn = ttk.Button(interact_frame, text="没问题，继续", command=self._on_understand_ok)
+        self.agent_revise_btn = ttk.Button(interact_frame, text="修改一下", command=self._on_revise)
+        # 符号校正确认行（find_check）
+        self.agent_find_label = ttk.Label(interact_frame, text="", wraplength=680)
+        self.agent_fix_confirm_btn = ttk.Button(interact_frame, text="就用这个，继续", command=self._on_find_fix_confirm)
         # 结果反馈行
         self.agent_satisfied_btn = ttk.Button(interact_frame, text="结果满意", command=self._on_satisfied)
         self.agent_feedback_btn = ttk.Button(interact_frame, text="提出修改意见", command=self._on_feedback_submit)
@@ -2899,6 +3091,22 @@ class ExcelProcessorApp:
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.agent_log_text = scrolledtext.ScrolledText(log_frame, height=12, wrap=tk.WORD)
         self.agent_log_text.pack(fill=tk.BOTH, expand=True)
+
+        # 处理间隙动态 Loading（LLM 调用/程序处理期间显示，横向波浪点 + 阶段文案）
+        self.agent_loading_frame = ttk.Frame(log_frame)
+        try:
+            # 尽量透明（macOS Tk 支持 systemTransparent）；不支持则回退系统控件底色与容器融合
+            self.agent_loading_canvas = tk.Canvas(self.agent_loading_frame, width=64, height=18,
+                                                  bg='systemTransparent', highlightthickness=0)
+        except tk.TclError:
+            self.agent_loading_canvas = tk.Canvas(self.agent_loading_frame, width=64, height=18,
+                                                  bg='SystemButtonFace', highlightthickness=0)
+        self.agent_loading_canvas.pack(side=tk.LEFT, padx=(0, 10))
+        self.agent_loading_label = ttk.Label(self.agent_loading_frame, text="正在处理，请稍候...",
+                                             foreground='#666666')
+        self.agent_loading_label.pack(side=tk.LEFT)
+        self.agent_loading_frame.pack(fill=tk.X, pady=(4, 0))   # 先 pack 再隐藏，保持布局一致
+        self.agent_loading_frame.pack_forget()
 
     def agent_select_files(self):
         """Agent：选择文件"""
@@ -2926,6 +3134,49 @@ class ExcelProcessorApp:
             self.agent_log_text.insert(tk.END, f"[{timestamp}] {message}\n")
             self.agent_log_text.see(tk.END)
             self.root.update()
+
+    # ---- 处理间隙动态 Loading（LLM 调用/程序处理期间显示） ----
+
+    def _start_loading(self, text='正在处理，请稍候...'):
+        """显示 Loading 并启动波浪动画（须在主线程调用）"""
+        self.agent_loading_label.config(text=text)
+        self.agent_loading_frame.pack(fill=tk.X, pady=(4, 0))
+        self._loading_on = True
+        self._loading_phase = 0.0
+        self._loading_job = None
+        self._draw_loading_wave()
+
+    def _draw_loading_wave(self):
+        """Canvas 横向波浪点：5 点横向排列、正弦起伏且大小同步变化（柔和打字式波浪）"""
+        if not getattr(self, '_loading_on', False):
+            return
+        import math
+        c = self.agent_loading_canvas
+        c.delete('all')
+        n, spacing, cy = 5, 10, 9
+        start_x = (64 - spacing * (n - 1)) / 2
+        for i in range(n):
+            phase = self._loading_phase + i * (2 * math.pi / n)
+            wave = math.sin(phase)
+            y = cy - wave * 4                                # 上下起伏（幅度 4px）
+            r = 2.2 + 1.2 * ((wave + 1) / 2)                 # 半径随起伏同步变化（2.2~3.4）
+            x = start_x + i * spacing
+            c.create_oval(x - r, y - r, x + r, y + r, fill='#4a90ff', outline='')
+        self._loading_phase += 0.3
+        self._loading_job = self.root.after(100, self._draw_loading_wave)
+
+    def _stop_loading(self):
+        """停止动画并隐藏（须在主线程调用）"""
+        self._loading_on = False
+        job = getattr(self, '_loading_job', None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._loading_job = None
+        self.agent_loading_canvas.delete('all')
+        self.agent_loading_frame.pack_forget()
 
     def _ensure_agent_graph(self):
         """按需初始化 LangGraph，避免将其放在主窗口启动路径上。"""
@@ -2987,6 +3238,7 @@ class ExcelProcessorApp:
         """隐藏交互区全部控件"""
         for w in (self.agent_clarify_label, self.agent_clarify_entry, self.agent_clarify_submit_btn,
                   self.agent_understand_label, self.agent_understand_ok_btn, self.agent_revise_btn,
+                  self.agent_find_label, self.agent_fix_confirm_btn,
                   self.agent_satisfied_btn, self.agent_feedback_btn):
             w.pack_forget()
 
@@ -3005,6 +3257,7 @@ class ExcelProcessorApp:
 
         def worker():
             try:
+                self.root.after(0, lambda: self._start_loading("正在继续分析，请稍候..."))
                 partial = self.agent_graph.invoke(
                     command, config=self.agent_thread_config,
                     interrupt_before=["execute_builtin", "sandbox_execute"])
@@ -3013,6 +3266,7 @@ class ExcelProcessorApp:
                 self.agent_log(f"✗ 处理失败: {str(e)}")
                 self._agent_set_plan(f"处理失败: {str(e)}", False)
             finally:
+                self.root.after(0, self._stop_loading)
                 self.agent_running = False
                 self.agent_analyze_btn.config(state=tk.NORMAL)
 
@@ -3025,32 +3279,79 @@ class ExcelProcessorApp:
             return ''
         return _column_structure_text(metas)
 
+    def _describe_plan_plain(self, task, params, metas):
+        """把任务+参数翻译成客服式口语（兜底：friendly_summary 缺失/截断时用）"""
+        fname = (metas[0].get('basename') if metas else '文件')
+        if task == 'modify_excel':
+            ops_desc = []
+            for op in params.get('ops') or []:
+                if not isinstance(op, dict):
+                    continue
+                col = op.get('column', '')
+                if op.get('type') == 'replace':
+                    find, repl = op.get('find', ''), op.get('replace', '')
+                    ops_desc.append(f"把 {col} 列里出现的『{find}』这几个字{'去掉' if repl == '' else '换成『' + repl + '』'}")
+                elif op.get('type') == 'delete_rows':
+                    ops_desc.append(f"删除 {col} 列等于『{op.get('equals', '')}』的行")
+            if ops_desc:
+                tail = ('改好的内容会直接覆盖保存回原文件，原来的内容将无法恢复，建议先备份原件。'
+                        if str(params.get('save_mode') or '').strip().lower() == 'overwrite'
+                        else '改好的内容会保存成一个新文件，您原来的文件不会被动。')
+                return ('我准备这样处理「' + fname + '」：\n' +
+                        '\n'.join('  · ' + d for d in ops_desc) +
+                        '\n' + tail)
+        if task == 'filter_excel':
+            op = params.get('operator', 'equals')
+            op_text = {'equals': '等于', 'not_equals': '不等于', 'contains': '包含',
+                       'gte': '大于等于', 'lte': '小于等于', 'gt': '大于', 'lt': '小于'}.get(op, op)
+            return f"我会筛选出 {params.get('column', '')} 列{op_text}『{params.get('value', '')}』的行，单独存成一个新文件。"
+        if task == 'statistics':
+            return "我会帮您统计这份文件的匹配占比、成功率、渠道分布等数据，生成统计结果。"
+        if task == 'export_failed':
+            return "我会把失败项整理导出成一个新文件，方便您单独查看。"
+        if task == 'export_csv':
+            return f"我会把指定列（{params.get('columns', '')}）导出成一个 CSV 文件。"
+        if task == 'diff':
+            return "我会对比两个文件的 O 列渠道差异。"
+        if task == 'sort_excel':
+            return f"我会按 {params.get('column', '')} 列{'升序' if not params.get('desc') else '降序'}重新排列数据。"
+        if task == 'group_excel':
+            return f"我会按 {params.get('column', '')} 列把数据分组到不同的 Sheet 里。"
+        if task == 'split_excel':
+            return f"我会把文件按每 {params.get('rows_per_sheet', 500)} 行拆分成多个 Sheet。"
+        # 兜底：未翻译的任务保留原 JSON
+        return f"我会按识别出的参数来处理：{json.dumps(params, ensure_ascii=False)}"
+
     def _intent_friendly_text(self, partial):
-        """将意图识别结果整理为运维可读的自然语言文本（替代原始 JSON 展示）"""
+        """将意图识别结果整理为客服式口语（LLM friendly_summary 优先，代码兜底）"""
         intent = partial.get('intent') or {}
         task = intent.get('task', '')
         params = intent.get('params') or {}
         understanding = intent.get('understanding') or ''
+        friendly = intent.get('friendly_summary') or ''
         reason = intent.get('reason') or ''
         questions = intent.get('clarify_questions') or []
+        metas = partial.get('file_metadata') or []
         lines = []
-        # 需求理解（兜底：custom 用 reason，否则用需求文本）
-        if not understanding:
-            understanding = reason or f"根据你的需求处理文件：{(partial.get('user_request') or '')[:120]}"
-        lines.append(f"需求理解：{understanding}")
-        # 识别结果
-        if task == 'custom':
-            lines.append(f"识别结果：内置工具无法直接满足（{reason or '需要自定义处理'}）")
+        # 需求理解（LLM 生成；兜底：custom 用 reason，否则用需求文本）
+        if understanding:
+            lines.append(understanding)
+        elif task == 'custom':
+            lines.append(reason or '这个需求比较特殊，内置工具处理不了，我需要写一段代码来完成。')
         else:
-            desc = TOOL_REGISTRY.get(task, {}).get('description', task)
-            lines.append(f"识别结果：{task}（{desc}）")
-            if params:
-                lines.append(f"参数：{json.dumps(params, ensure_ascii=False)}")
+            lines.append('根据您的需求，我来帮您处理文件。')
+        # 方案口语（LLM friendly_summary 优先，代码兜底）
+        if task == 'custom':
+            lines.append('（这个需求需要动态编写代码来执行）')
+        elif friendly:
+            lines.append(friendly)
+        else:
+            lines.append(self._describe_plan_plain(task, params, metas))
         # 待澄清问题
         if questions:
-            lines.append('待澄清问题：')
+            lines.append('不过有几个地方想先跟您确认一下：')
             for i, q in enumerate(questions, 1):
-                lines.append(f"  {i}. {q}")
+                lines.append(f"{i}. {q}")
         return '\n'.join(lines)
 
     def _show_clarify(self, partial, questions):
@@ -3061,13 +3362,13 @@ class ExcelProcessorApp:
         col_text = self._file_structure_text(partial)
         if col_text:
             lines += ['文件列结构：', col_text, '']
-        lines.append('需要你补充以下信息：')
+        lines.append('为了更准确地帮您处理，想跟您确认几个小问题：')
         for i, q in enumerate(questions, 1):
             lines.append(f"{i}. {q}")
         lines.append('')
-        lines.append('请在上方输入框填写回答；多个问题请用 | 分隔，然后点击「提交回答」。')
+        lines.append('直接在输入框里回答就行；如果有多个问题，用 | 分隔，然后点「好的，提交」。')
         self._agent_set_plan('\n'.join(lines), False)
-        self.agent_clarify_label.config(text='你的回答（多个问题用 | 分隔）：')
+        self.agent_clarify_label.config(text='您的回答（多个问题用 | 分隔）：')
         self.agent_clarify_entry.delete(0, tk.END)
         self._pack_interaction([self.agent_clarify_label, self.agent_clarify_entry, self.agent_clarify_submit_btn])
 
@@ -3096,12 +3397,12 @@ class ExcelProcessorApp:
     def _show_understanding_wait(self, partial, understanding):
         """Loop②理解确认交互：展示友好意图结果 + 文件列结构，等待用户确认/修正"""
         self.agent_phase = 'understanding'
-        self.agent_log("需要你确认对需求的理解是否正确")
+        self.agent_log("请用户确认对需求的理解")
         text = self._intent_friendly_text(partial)
         col_text = self._file_structure_text(partial)
         if col_text:
             text += f"\n\n文件列结构：\n{col_text}"
-        text += "\n\n请确认理解是否正确，或点击「修正需求」补充信息。"
+        text += "\n\n麻烦您看看我理解得对不对：如果没问题，点「没问题，继续」；要是哪里不对，点「修改一下」，我马上调整。"
         self._agent_set_plan(text, False)
         self.agent_understand_label.config(text=f"我的理解：{understanding}")
         self._pack_interaction([self.agent_understand_label, self.agent_understand_ok_btn, self.agent_revise_btn])
@@ -3117,25 +3418,108 @@ class ExcelProcessorApp:
         self.agent_phase = 'analyze'
         self._resume_graph(Command(resume={'ok': True}))
 
+    def _ask_multiline(self, title, prompt):
+        """宽大多行输入对话框（替代 simpledialog 单行小框）；返回输入文本，取消返回 None"""
+        result = {'value': None}
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(True, True)
+        dlg.geometry('620x340')
+        dlg.minsize(480, 260)
+
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=prompt, wraplength=560).pack(anchor=tk.W, pady=(0, 6))
+        text = scrolledtext.ScrolledText(frame, width=72, height=10, wrap=tk.WORD)
+        text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        text.focus_set()
+
+        def on_ok():
+            result['value'] = text.get('1.0', tk.END).strip()
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="确定", command=on_ok).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="取消", command=on_cancel).pack(side=tk.RIGHT)
+        dlg.bind('<Escape>', lambda e: on_cancel())
+        dlg.bind('<Control-Return>', lambda e: on_ok())   # Ctrl+Enter 快捷提交
+        dlg.protocol('WM_DELETE_WINDOW', on_cancel)
+
+        self.root.wait_window(dlg)
+        return result['value']
+
+    def _confirm_overwrite(self, fname):
+        """覆盖原文件前的红色警醒确认（覆盖不可逆、提示备份）；返回 True 继续 / False 取消"""
+        result = {'ok': False}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("⚠ 覆盖原文件确认")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry('500x280')
+        dlg.minsize(460, 260)
+
+        head = tk.Label(dlg, text="⚠ 即将覆盖原文件", fg='#cc0000', bg='#fff0f0',
+                        font=('', 14, 'bold'), pady=8)
+        head.pack(fill=tk.X)
+
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        msg = (f"您选择将修改结果直接保存回原文件：\n\n「{fname}」\n\n"
+               f"⚠ 此操作【不可逆】：原文件内容将被覆盖，无法恢复！\n"
+               f"请确认已提前备份好原件，再继续操作。")
+        ttk.Label(body, text=msg, wraplength=440, foreground='#cc0000').pack(anchor=tk.W, pady=(0, 14))
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="我已知晓并已备份，继续覆盖",
+                   command=lambda: (result.update(ok=True), dlg.destroy())).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
+        dlg.protocol('WM_DELETE_WINDOW', dlg.destroy)
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+        self.root.wait_window(dlg)
+        return result['ok']
+
     def _on_revise(self):
-        """用户修正需求 → 带着修正重新理解（Loop②重入）"""
+        """用户修正需求：understanding 阶段带着修正重新理解（Loop②重入）；find_check 阶段重新分析"""
         from langgraph.types import Command
-        if self.agent_phase != 'understanding':
-            return
-        revision = simpledialog.askstring("修正需求", "请补充或修正你的需求：", parent=self.root)
-        if revision is None:
-            return
-        revision = revision.strip()
-        self._hide_interaction()
-        self.agent_log(f"用户修正需求: {revision[:120]}")
-        self._agent_write_log(self._agent_task_id(), 'understanding', {'ok': False, 'revision': revision})
-        if not revision:
-            # 修正为空 → 视为确认理解，按原需求继续
+        if self.agent_phase == 'understanding':
+            revision = self._ask_multiline("修改一下", "请补充或修正您的需求：")
+            if revision is None:
+                return
+            revision = revision.strip()
+            self._hide_interaction()
+            self.agent_log(f"用户修正需求: {revision[:120]}")
+            self._agent_write_log(self._agent_task_id(), 'understanding', {'ok': False, 'revision': revision})
+            if not revision:
+                # 修正为空 → 视为确认理解，按原需求继续
+                self.agent_phase = 'analyze'
+                self._resume_graph(Command(resume={'ok': True}))
+                return
             self.agent_phase = 'analyze'
-            self._resume_graph(Command(resume={'ok': True}))
+            self._resume_graph(Command(resume={'ok': False, 'revision': revision}))
             return
-        self.agent_phase = 'analyze'
-        self._resume_graph(Command(resume={'ok': False, 'revision': revision}))
+        if self.agent_phase == 'find_check':
+            # 查找内容未命中：请用户提供文件中查找内容的实际写法，然后重新分析
+            revision = self._ask_multiline("修改一下", "请告诉我文件里查找内容的实际写法：")
+            if revision is None:
+                return
+            revision = revision.strip()
+            if not revision:
+                return
+            self._hide_interaction()
+            self.agent_log(f"用户修正需求: {revision[:120]}，重新分析")
+            current = self.agent_request_text.get('1.0', tk.END).strip()
+            self.agent_request_text.delete('1.0', tk.END)
+            self.agent_request_text.insert(tk.END, current + f"\n（修正：{revision}）")
+            self.agent_phase = 'idle'
+            self.agent_analyze()
 
     def _show_feedback(self, final):
         """Loop④结果反馈：展示结果摘要 + 自检结论，等待用户满意/提出修改意见"""
@@ -3172,7 +3556,7 @@ class ExcelProcessorApp:
         """用户提出修改意见 → 带上下文启动新一轮分析（Loop④重入）"""
         if self.agent_phase != 'feedback':
             return
-        feedback = simpledialog.askstring("提出修改意见", "请描述需要修改的地方：", parent=self.root)
+        feedback = self._ask_multiline("提出修改意见", "请描述需要修改的地方：")
         if feedback is None:
             return
         feedback = feedback.strip()
@@ -3275,6 +3659,7 @@ class ExcelProcessorApp:
 
         def worker():
             try:
+                self.root.after(0, lambda: self._start_loading("正在识别需求并制定方案，请稍候..."))
                 partial = self.agent_graph.invoke(
                     initial, config=self.agent_thread_config,
                     interrupt_before=["execute_builtin", "sandbox_execute"])
@@ -3283,6 +3668,7 @@ class ExcelProcessorApp:
                 self.agent_log(f"✗ 分析失败: {str(e)}")
                 self._agent_set_plan(f"分析失败: {str(e)}", False)
             finally:
+                self.root.after(0, self._stop_loading)
                 self.agent_running = False
                 self.agent_analyze_btn.config(state=tk.NORMAL)
 
@@ -3290,14 +3676,12 @@ class ExcelProcessorApp:
 
     def _handle_stage1(self, partial):
         """处理阶段1结果：循环处理澄清/理解确认中断，最终展示方案或等待用户交互"""
-        from langgraph.types import Command
         for lg in partial.get('logs') or []:
             self.agent_log(lg)
         snapshot = self.agent_graph.get_state(self.agent_thread_config)
         next_nodes = tuple(snapshot.next or ())
         intent = partial.get('intent') or {}
         questions = intent.get('clarify_questions') or []
-        task = intent.get('task', '')
         task_id = self._agent_task_id()
         self._agent_write_log(task_id, 'stage1', {
             'intent': intent,
@@ -3311,18 +3695,13 @@ class ExcelProcessorApp:
             self._show_clarify(partial, questions)
             return
         if 'show_understanding' in next_nodes:
-            # Loop②：理解确认
+            # Loop②：理解确认 —— 始终展示需求确认视图，等待用户确认/修正
             understanding = intent.get('understanding', '')
             if not understanding:
                 # 兜底：截断/旧格式导致 understanding 缺失时用 reason 或需求文本
                 understanding = (intent.get('reason') or
                                  f"根据你的需求处理文件：{(partial.get('user_request') or '')[:120]}")
             self.agent_log(f"我的理解：{understanding}")
-            # 需求明确（无澄清问题、非 custom）→ 自动确认理解，继续规划
-            if not questions and task != 'custom':
-                self.agent_log("需求明确，理解确认通过，继续规划")
-                self._resume_graph(Command(resume={'ok': True}))
-                return
             self._show_understanding_wait(partial, understanding)
             return
         # 已通过澄清/理解，停在执行前中断点（interrupt_before）→ 展示方案
@@ -3338,17 +3717,105 @@ class ExcelProcessorApp:
             self._show_dynamic_plan(partial)
             return
         self.agent_pending_plan = {'task': tool, 'params': params, 'files': list(self.agent_selected_files)}
+        # 符号预检：replace 类 find 未命中（含变体/无变体）→ 先与用户确认，再展示方案
+        issues = self._check_replace_finds(partial)
+        if issues:
+            self._show_find_check(partial, issues)
+            return
+        self._render_plan_view(partial)
+
+    def _render_plan_view(self, partial):
+        """口语化渲染 builtin 方案预览（LLM friendly_summary 优先，代码兜底），并启用「确认执行」"""
+        plan = partial.get('plan') or {}
+        tool = plan.get('tool') or ''
+        params = plan.get('params') or {}
+        intent = partial.get('intent') or {}
+        understanding = intent.get('understanding', '')
+        friendly = intent.get('friendly_summary') or ''
         lines = []
-        understanding = (partial.get('intent') or {}).get('understanding', '')
         if understanding:
-            lines.append(f"需求理解：{understanding}")
+            lines.append(understanding)
+        lines.append(friendly or self._describe_plan_plain(tool, params, partial.get('file_metadata') or []))
         for m in partial.get('file_metadata') or []:
             lines.append(f"文件: {m.get('basename')} | {m.get('type')} | 行{m.get('rows')} 列{m.get('columns')}")
-        lines.append(f"任务: {tool}（{TOOL_REGISTRY.get(tool, {}).get('description', '')}）")
         lines.append(f"风险等级: {plan.get('risk_level', 'low')}")
-        lines.append(f"参数: {json.dumps(params, ensure_ascii=False)}")
         self.agent_log(f"识别成功: task={tool}, params={json.dumps(params, ensure_ascii=False)}")
         self._agent_set_plan('\n'.join(lines), True)
+
+    def _check_replace_finds(self, partial):
+        """对 plan 中 replace 类 op 做 find 存在性预检；返回未命中的 issues（含变体候选）"""
+        ops = ((partial.get('plan') or {}).get('params') or {}).get('ops')
+        if not isinstance(ops, list):
+            return []
+        files = list(self.agent_selected_files)
+        if not files or detect_file_type(files[0]) not in ('xlsx', 'xls'):
+            return []
+        issues = []
+        try:
+            for i, op in enumerate(ops):
+                if not isinstance(op, dict) or op.get('type') != 'replace':
+                    continue
+                find = str(op.get('find', '') or '')
+                if not find:
+                    continue
+                result = check_find_in_column(files[0], op.get('column', 1), find)
+                if not result['found']:
+                    issues.append({'op_index': i, 'column': op.get('column', 1),
+                                   'find': find, 'variants': result['variants']})
+        except Exception as e:
+            self.agent_log(f"方案预检（符号检测）跳过: {str(e)}")
+            return []
+        return issues
+
+    def _show_find_check(self, partial, issues):
+        """符号差异确认交互：展示检测详情 + 沟通话术，等待用户校正或修改需求"""
+        self.agent_phase = 'find_check'
+        self.agent_find_issues = issues
+        self.agent_find_partial = partial
+        issue = issues[0]
+        find = issue['find']
+        col = issue['column']
+        variants = issue['variants']
+        detail = f"我在文件里检查了一下，您要找的『{find}』（{col} 列）没有直接找到。\n"
+        if variants:
+            v = variants[0]
+            detail += f"不过文件里有写法很接近的『{v['find']}』，一共出现 {v['count']} 处。\n"
+            talk = (f"我检查了一下文件，没找到『{find}』，不过我注意到文件里其实有"
+                    f"『{v['find']}』（出现 {v['count']} 处），看起来很像您要找的内容。\n"
+                    f"要不要我按『{v['find']}』来处理？")
+        else:
+            detail += "而且也没找到写法相近的内容，可能需要您确认一下查找内容。\n"
+            talk = (f"我在文件里没有找到『{find}』，可能是查找的内容写法不对，"
+                    f"麻烦点「修改一下」告诉我文件里的实际写法。")
+        self._agent_set_plan(detail, False)
+        self.agent_find_label.config(text=talk)
+        if variants:
+            self._pack_interaction([self.agent_find_label, self.agent_fix_confirm_btn, self.agent_revise_btn])
+        else:
+            self._pack_interaction([self.agent_find_label, self.agent_revise_btn])
+
+    def _on_find_fix_confirm(self):
+        """用户确认按文件中的实际写法校正 → 更新 plan 并渲染方案，等待确认执行"""
+        if self.agent_phase != 'find_check':
+            return
+        issues = getattr(self, 'agent_find_issues', None) or []
+        partial = getattr(self, 'agent_find_partial', None)
+        if not issues or partial is None:
+            return
+        issue = issues[0]
+        variants = issue['variants']
+        if not variants:
+            return
+        v = variants[0]
+        ops = (self.agent_pending_plan or {}).get('params', {}).get('ops')
+        if isinstance(ops, list) and 0 <= issue['op_index'] < len(ops):
+            ops[issue['op_index']]['find'] = v['find']
+        self.agent_log(f"已按文件中的实际写法『{v['find']}』校正查找内容（原『{issue['find']}』未在文件中出现）")
+        self._agent_write_log(self._agent_task_id(), 'find_fix', {
+            'original_find': issue['find'], 'corrected_find': v['find'], 'count': v['count']})
+        self._hide_interaction()
+        self.agent_phase = 'analyze'
+        self._render_plan_view(partial)
 
     def _show_dynamic_plan(self, partial):
         """阶段1 动态代码方案展示：策略/说明/校验/代码预览 + 风险提示"""
@@ -3390,6 +3857,13 @@ class ExcelProcessorApp:
             return
         if not self._ensure_agent_graph():
             return
+        # 覆盖原文件（save_mode=overwrite）→ 先红色警醒确认（覆盖不可逆、提示备份）
+        params = plan.get('params') or {}
+        if str(params.get('save_mode') or '').strip().lower() == 'overwrite':
+            fname = os.path.basename((plan.get('files') or [''])[0]) or '原文件'
+            if not self._confirm_overwrite(fname):
+                self.agent_log("用户取消覆盖原文件")
+                return
         task_id = (self.agent_thread_config or {}).get('configurable', {}).get('thread_id', '')
         summary = self._agent_plan_summary(plan)
         if not messagebox.askyesno("确认执行方案", f"即将执行以下方案，确认继续？\n\n{summary}"):
@@ -3407,6 +3881,7 @@ class ExcelProcessorApp:
         def worker():
             error = None
             try:
+                self.root.after(0, lambda: self._start_loading("正在执行处理任务，请稍候..."))
                 final = self.agent_graph.invoke(None, config=self.agent_thread_config)
                 for lg in final.get('logs') or []:
                     self.agent_log(lg)
@@ -3434,6 +3909,7 @@ class ExcelProcessorApp:
                     'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
             finally:
+                self.root.after(0, self._stop_loading)
                 self.agent_running = False
                 self.agent_analyze_btn.config(state=tk.NORMAL)
                 self.agent_confirm_btn.config(state=tk.DISABLED)
@@ -3470,13 +3946,16 @@ class ExcelProcessorApp:
         result = response.json()
         return str(result.get('answer', '') or '')
 
-    def call_reflection_api(self, api_url, api_key, user_request, input_meta, output_meta, output_summary):
+    def call_reflection_api(self, api_url, api_key, user_request, input_meta, output_meta, output_summary,
+                            input_samples='', output_samples=''):
         """调用反思质检（复用 /chat-messages 通道，不新增 Dify 应用），返回 {satisfied, reason, suggestions}"""
         prompt = REFLECTION_PROMPT_TEMPLATE.format(
             request=user_request,
             input_meta=input_meta,
             output_meta=output_meta,
             output_summary=output_summary,
+            input_samples=input_samples,
+            output_samples=output_samples,
         )
         answer = self.call_intent_api(api_url, api_key, prompt)
         parsed = _parse_json_loose(answer)
@@ -3575,6 +4054,8 @@ class ExcelProcessorApp:
         elif not isinstance(params, dict):
             raise ValueError("params 必须为JSON对象")
         understanding = str(parsed.get('understanding') or '').strip()
+        fs_raw = parsed.get('friendly_summary')
+        friendly_summary = str(fs_raw).strip() if isinstance(fs_raw, str) else ''
         questions = parsed.get('clarify_questions')
         if not isinstance(questions, list):
             questions = []
@@ -3600,6 +4081,7 @@ class ExcelProcessorApp:
             'task': task,
             'params': params,
             'understanding': understanding,
+            'friendly_summary': friendly_summary,
             'clarify_questions': questions,
             'can_use_builtin_tool': can_builtin,
             'confidence': float(confidence) if isinstance(confidence, (int, float)) else None,
@@ -3742,7 +4224,7 @@ class ExcelProcessorApp:
         for row in ws.iter_rows(min_row=2):
             p_val = _cell_str(row, COL_FAIL)
             s_val = _cell_str(row, COL_MATCH_TYPE)
-            if p_val != '失败':
+            if not p_val.startswith('失败'):
                 continue
             is_forward_fail = s_val.startswith('正向失败')
             if mode == 'forward' and not is_forward_fail:
@@ -4154,7 +4636,7 @@ class ExcelProcessorApp:
                     ws.cell(row=row_idx, column=16).value = None
                     ws.cell(row=row_idx, column=16).fill = PatternFill()
                 else:
-                    ws.cell(row=row_idx, column=16).value = "失败"
+                    ws.cell(row=row_idx, column=16).value = "失败(正向)"
                     ws.cell(row=row_idx, column=16).fill = red_fill
                     reason = result.get('error') or '未知原因'
                     ws.cell(row=row_idx, column=19).value = f"正向失败: {reason[:50]}"
@@ -4734,8 +5216,8 @@ class ExcelProcessorApp:
                         ws.cell(row=row_idx, column=16).value = None
                         ws.cell(row=row_idx, column=16).fill = PatternFill()
                     else:
-                        # P列（第16列）：失败标记
-                        ws.cell(row=row_idx, column=16).value = "失败"
+                        # P列（第16列）：失败标记（带反向标识）
+                        ws.cell(row=row_idx, column=16).value = "失败(反向)"
                         ws.cell(row=row_idx, column=16).fill = red_fill
                         # S列（第19列）：匹配方式
                         ws.cell(row=row_idx, column=19).value = result['match_type']
